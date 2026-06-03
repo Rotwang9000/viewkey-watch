@@ -1,0 +1,11 @@
+node_modules/
+coverage/
+*.log
+npm-debug.log*
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+.env.*
+.DS_Store
