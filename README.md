@@ -20,7 +20,9 @@ to a watcher service. `viewkey-watch` turns that capability into a small, well�
 Everything is plain ESM, dependency‑injected (nothing reads `process.env` or holds shared
 mutable state), and ships with a full unit‑test suite.
 
-> **Status:** extracted from a production deployment; `0.x` while the public API settles.
+> **Status:** powers the **Private Watch** product in production at
+> [api.seneschal.space](https://api.seneschal.space/v1/private/info) — Monero/Zcash view‑key
+> payment webhooks plus XMR/ZEC credit top‑ups. `0.x` while the public API settles.
 
 ## How it works
 
