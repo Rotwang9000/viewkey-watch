@@ -72,6 +72,10 @@ const DEFAULT_RESPONSE_MAX_BYTES = WATCH_CONSTANTS.WEBHOOK_RESPONSE_MAX_BYTES;
  * Optional deps:
  *   - fetchImpl: defaults to globalThis.fetch (used for webhook POST)
  *   - webhookTimeoutMs
+ *   - headerPrefix: outbound webhook header namespace (default 'x-viewkey');
+ *       an embedding host passes its own (e.g. 'x-payment') so the poller's
+ *       live webhooks match what its REST layer advertises.
+ *   - userAgent: outbound webhook User-Agent (default 'viewkey-watch/0.1.0')
  *   - logger: { info, warn, error } (default console)
  *   - now: () => ms (defaults Date.now)
  */
@@ -83,6 +87,8 @@ export async function runPollerTick(deps) {
 		fetchImpl = globalThis.fetch,
 		webhookTimeoutMs = DEFAULT_WEBHOOK_TIMEOUT_MS,
 		responseMaxBytes = DEFAULT_RESPONSE_MAX_BYTES,
+		headerPrefix = DEFAULT_WEBHOOK_HEADER_PREFIX,
+		userAgent = DEFAULT_WEBHOOK_USER_AGENT,
 		logger = console,
 		now = () => Date.now()
 	} = deps;
@@ -114,6 +120,7 @@ export async function runPollerTick(deps) {
 			await pollOne({
 				row, db, masterKey, nfptClient,
 				fetchImpl, webhookTimeoutMs, responseMaxBytes,
+				headerPrefix, userAgent,
 				logger, now, summary
 			});
 		}
@@ -133,7 +140,7 @@ export async function runPollerTick(deps) {
 	return summary;
 }
 
-async function pollOne({ row, db, masterKey, nfptClient, fetchImpl, webhookTimeoutMs, responseMaxBytes, logger, now, summary }) {
+async function pollOne({ row, db, masterKey, nfptClient, fetchImpl, webhookTimeoutMs, responseMaxBytes, headerPrefix, userAgent, logger, now, summary }) {
 	const tickStartMs = now();
 
 	// Surge pricing: the meter math reads the locked-in rate from
@@ -173,6 +180,7 @@ async function pollOne({ row, db, masterKey, nfptClient, fetchImpl, webhookTimeo
 		&& Number(row.credit_atomic ?? 0) > 0) {
 		const fired = await maybeFireLowCredit({
 			row, db, fetchImpl, webhookTimeoutMs, responseMaxBytes,
+			headerPrefix, userAgent,
 			nowMs: tickStartMs, logger
 		});
 		if (fired) {
@@ -260,7 +268,9 @@ async function pollOne({ row, db, masterKey, nfptClient, fetchImpl, webhookTimeo
 		watchId: row.id,
 		fetchImpl,
 		timeoutMs: webhookTimeoutMs,
-		responseMaxBytes
+		responseMaxBytes,
+		headerPrefix,
+		userAgent
 	});
 	if (result.ok) {
 		summary.webhooks_delivered += 1;
@@ -323,7 +333,7 @@ async function pollOne({ row, db, masterKey, nfptClient, fetchImpl, webhookTimeo
  *
  * Returns true if the webhook was successfully delivered.
  */
-async function maybeFireLowCredit({ row, db, fetchImpl, webhookTimeoutMs, responseMaxBytes, nowMs, logger }) {
+async function maybeFireLowCredit({ row, db, fetchImpl, webhookTimeoutMs, responseMaxBytes, headerPrefix, userAgent, nowMs, logger }) {
 	const body = buildLowCreditBody({
 		watchId: row.id,
 		chain: row.chain,
@@ -338,7 +348,9 @@ async function maybeFireLowCredit({ row, db, fetchImpl, webhookTimeoutMs, respon
 		watchId: row.id,
 		fetchImpl,
 		timeoutMs: webhookTimeoutMs,
-		responseMaxBytes
+		responseMaxBytes,
+		headerPrefix,
+		userAgent
 	});
 	if (!result.ok) {
 		logger.warn?.({

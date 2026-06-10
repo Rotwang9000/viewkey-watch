@@ -1,6 +1,6 @@
 {
 	"name": "viewkey-watch",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"description": "Watch a Monero/Zcash view key and get HMAC-signed webhooks when funds land — no full node, no spend keys. Includes credit metering and XMR/ZEC top-up detection.",
 	"type": "module",
 	"license": "MIT",

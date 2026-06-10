@@ -121,6 +121,37 @@ describe('runPollerTick — first poll', () => {
 	});
 });
 
+describe('runPollerTick — webhook branding', () => {
+	test('threads a custom headerPrefix + userAgent to the delivered webhook', async () => {
+		makeMoneroWatch();
+		const responses = [
+			{ status: 202, body: { data: { jobId: 'J1', jobToken: 'T1' } } },
+			{ status: 200, body: { data: { job: {
+				jobId: 'J1', status: 'completed',
+				progress: { scannedHeight: 100, chainHeight: 100, scanProgress: 1, percentComplete: 100 },
+				balance: { totalAtomic: '0', spendableAtomic: '0', lockedAtomic: '0' },
+				error: null
+			} } } }
+		];
+		const nfpt = stubNfpt(responses);
+		await runPollerTick({
+			db, masterKey: MASTER_KEY,
+			nfptClient: nfpt.client,
+			fetchImpl: webhookCapture(),
+			headerPrefix: 'x-payment',
+			userAgent: 'PaymentsGateway-PrivateWatch/1.0',
+			now: () => NOW + 1000,
+			logger: { info: () => {}, warn: () => {}, error: () => {} }
+		});
+		expect(webhookEvents.length).toBe(1);
+		const headers = webhookEvents[0].init.headers;
+		expect(headers['x-payment-watch-id']).toBeDefined();
+		expect(headers['x-payment-signature'].startsWith('sha256=')).toBe(true);
+		expect(headers['user-agent']).toBe('PaymentsGateway-PrivateWatch/1.0');
+		expect(headers['x-viewkey-signature']).toBeUndefined();
+	});
+});
+
 describe('runPollerTick — balance change', () => {
 	test('emits balance_change when balance grows', async () => {
 		const w = makeMoneroWatch();
@@ -276,6 +307,28 @@ describe('deliverWebhook', () => {
 		expect(sig.startsWith('sha256=')).toBe(true);
 		const expected = signWebhookBody(body, secret);
 		expect(sig).toBe(`sha256=${expected}`);
+	});
+
+	test('honours a custom headerPrefix + userAgent', async () => {
+		let captured = null;
+		const fetchImpl = async (url, init) => {
+			captured = { url, init };
+			return { status: 200, text: async () => 'ok' };
+		};
+		await deliverWebhook({
+			url: 'https://example.com/hook',
+			body: JSON.stringify({ hello: 'world' }),
+			secret: '3a'.repeat(32),
+			watchId: 'w1',
+			fetchImpl,
+			headerPrefix: 'x-payment',
+			userAgent: 'PaymentsGateway-PrivateWatch/1.0'
+		});
+		expect(captured.init.headers['x-payment-watch-id']).toBe('w1');
+		expect(captured.init.headers['x-payment-signature'].startsWith('sha256=')).toBe(true);
+		expect(captured.init.headers['user-agent']).toBe('PaymentsGateway-PrivateWatch/1.0');
+		// The default namespace must NOT leak through when overridden.
+		expect(captured.init.headers['x-viewkey-watch-id']).toBeUndefined();
 	});
 
 	test('returns ok:false on 500', async () => {
