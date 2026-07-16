@@ -292,4 +292,25 @@ describe('normaliseMonero / normaliseOrchard', () => {
 		expect(out.balanceAtomic).toBe('0');
 		expect(out.notes).toBe(0);
 	});
+
+	test('normaliseOrchard reads NFPT live progress shape (latestHeight)', () => {
+		const out = normaliseOrchard({
+			status: 'running',
+			progress: { currentStart: 3_100_000, latestHeight: 3_099_999, blocksScanned: 57_999, transactionsScanned: 12, notesFound: 0 },
+			results: { notes: [] }
+		});
+		expect(out.scannedHeight).toBe(3_099_999);
+		expect(out.chainHeight).toBe(3_099_999);
+	});
+
+	test('normaliseOrchard prefers explicit scannedToHeight/chainTip when present', () => {
+		const out = normaliseOrchard({
+			status: 'succeeded',
+			progress: { scannedToHeight: 3_414_000, chainTip: 3_414_400, latestHeight: 3_413_000, percentComplete: 100 },
+			results: { notes: [] }
+		});
+		expect(out.scannedHeight).toBe(3_414_000);
+		expect(out.chainHeight).toBe(3_414_400);
+		expect(out.scanProgress).toBe(1);
+	});
 });

@@ -583,8 +583,12 @@ export function normaliseOrchard(job) {
 		receivedAtomic: receivedAtomic.toString(),
 		notes: notes.length,
 		unspentNotes: notes.filter((n) => n?.spent !== true).length,
-		scannedHeight: progress.scannedToHeight ?? progress.endHeight ?? 0,
-		chainHeight: progress.chainTip ?? progress.endHeight ?? 0,
+		// NFPT's live job shape reports `progress.latestHeight` (updated
+		// per scan batch) and never `scannedToHeight`/`chainTip` — without
+		// the latestHeight fallback a poller-side caller persists 0 forever
+		// and restarts every scan from the birthday.
+		scannedHeight: progress.scannedToHeight ?? progress.latestHeight ?? progress.endHeight ?? 0,
+		chainHeight: progress.chainTip ?? progress.endHeight ?? progress.latestHeight ?? 0,
 		scanProgress: progress.percentComplete != null ? progress.percentComplete / 100 : 0,
 		percentComplete: progress.percentComplete ?? 0,
 		error: job?.error ?? null
