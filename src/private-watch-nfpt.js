@@ -414,10 +414,13 @@ export function extractIncoming(chain, rawJob) {
 	if (!rawJob) return [];
 	if (chain === 'zcash') {
 		const notes = Array.isArray(rawJob?.results?.notes) ? rawJob.results.notes : [];
+		// NFPT's Orchard scanner emits snake_case (tx_hash, block_height) —
+		// missing those aliases left every payment with confirmations
+		// permanently at 0, stuck in 'confirming' and never settling.
 		return notes.map((n) => ({
 			amountAtomic: stringOrNull(n?.value ?? n?.amount ?? n?.amountAtomic) ?? '0',
-			txHash: n?.txHash ?? n?.txid ?? null,
-			blockHeight: n?.height ?? n?.blockHeight ?? null,
+			txHash: n?.txHash ?? n?.txid ?? n?.tx_hash ?? null,
+			blockHeight: n?.height ?? n?.blockHeight ?? n?.block_height ?? null,
 			memo: decodeMemo(n)
 		}));
 	}

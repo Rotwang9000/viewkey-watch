@@ -391,3 +391,15 @@ describe('scanReceiving — timeout cancel semantics', () => {
 		expect(cancels).toHaveLength(1);
 	});
 });
+
+describe('extractIncoming — NFPT field aliases', () => {
+	test('zcash notes in NFPT snake_case (tx_hash, block_height) map fully', async () => {
+		const { extractIncoming } = await import('../src/private-watch-nfpt.js');
+		const out = extractIncoming('zcash', { results: { notes: [
+			{ value: '35970000', tx_hash: 'abc123', block_height: 3415572, memo: 'PG-3f4807e5' }
+		] } });
+		expect(out).toEqual([
+			{ amountAtomic: '35970000', txHash: 'abc123', blockHeight: 3415572, memo: 'PG-3f4807e5' }
+		]);
+	});
+});
