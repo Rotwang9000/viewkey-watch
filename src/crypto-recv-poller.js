@@ -149,7 +149,10 @@ export async function runCryptoRecvTick({
 			}
 
 			let res;
-			try { res = await applyCredit({ watchId: quote.watch_id, usdCents }); }
+			// quoteId lets the applier dispatch on the EXACT quote that was
+			// paid — amount-based dispatch confuses two same-priced products
+			// (e.g. a $5 scan top-up vs a $5 one-day feature).
+			try { res = await applyCredit({ watchId: quote.watch_id, usdCents, quoteId: quote.id }); }
 			catch (err) { res = { ok: false, reason: err?.message ?? String(err) }; }
 
 			if (res?.ok) {

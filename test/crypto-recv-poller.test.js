@@ -110,7 +110,7 @@ describe('runCryptoRecvTick — state machine', () => {
 		const scan = async () => ({ chainHeight: 100, incoming: [{ amountAtomic: XMR_AMOUNT.toString(), txHash: 'tx1', blockHeight: 91 }] });
 		const summary = await runCryptoRecvTick({ db, chains: ['monero'], scan, applyCredit: apply, confirmations: { monero: 10 } });
 		expect(summary.settled).toBe(1);
-		expect(apply.calls[0]).toEqual({ watchId: 'w-1', usdCents: 500 });
+		expect(apply.calls[0]).toEqual({ watchId: 'w-1', usdCents: 500, quoteId: 'q1' });
 		expect(getQuote(db, 'q1')).toMatchObject({ status: 'settled', credited_usd_cents: 500, confirmations: 10 });
 	});
 
@@ -178,7 +178,7 @@ describe('runCryptoRecvTick — state machine', () => {
 		// With grace covering the deadline, it settles honestly.
 		const summary = await runCryptoRecvTick({ db, chains: ['zcash'], scan, applyCredit: apply, confirmations: { zcash: 8 }, matchGraceMs: 100_000, now: () => 10_000 });
 		expect(summary.settled).toBe(1);
-		expect(apply.calls).toEqual([{ watchId: 'w-1', usdCents: 500 }]);
+		expect(apply.calls).toEqual([{ watchId: 'w-1', usdCents: 500, quoteId: 'late' }]);
 		expect(getQuote(db, 'late')).toMatchObject({ status: 'settled', credited_usd_cents: 500 });
 	});
 });
