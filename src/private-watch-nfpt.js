@@ -348,7 +348,8 @@ export async function scanReceiving(client, {
 	fromHeight,
 	birthdayHeight,
 	pollIntervalMs = 1_500,
-	maxWaitMs = 120_000
+	maxWaitMs = 120_000,
+	cancelOnTimeout = true
 }) {
 	if (chain !== 'monero' && chain !== 'zcash') {
 		throw new TypeError(`scanReceiving: chain must be 'monero' or 'zcash'`);
@@ -365,6 +366,7 @@ export async function scanReceiving(client, {
 		});
 	const startedAt = Date.now();
 	let lastJob = null;
+	let completed = false;
 	while (Date.now() - startedAt < maxWaitMs) {
 		const polled = chain === 'monero'
 			? await pollMoneroJob(client, started)
@@ -377,21 +379,29 @@ export async function scanReceiving(client, {
 		if (TERMINAL_FAILURE_STATES.has(lastJob.status)) {
 			throw new Error(`scanReceiving: job ended ${lastJob.status} (chain=${chain})`);
 		}
-		const isComplete = TERMINAL_SUCCESS_STATES.has(lastJob.status)
+		completed = TERMINAL_SUCCESS_STATES.has(lastJob.status)
 			|| (lastJob.scanProgress != null && lastJob.scanProgress >= 0.999);
-		if (isComplete) break;
+		if (completed) break;
 		await sleep(pollIntervalMs);
 	}
 	if (!lastJob) throw new Error('scanReceiving: NFPT never returned a job snapshot');
 	const rawJob = await fetchRawJob(client, chain, started);
 	const chainHeight = lastJob.chainHeight ?? 0;
 	const incoming = extractIncoming(chain, rawJob);
-	try {
-		if (chain === 'monero') await cancelMoneroJob(client, started);
-		else await cancelOrchardJob(client, started);
+	// NFPT discards a cancelled job's progress and only writes its result
+	// cache when a scan COMPLETES. Cancelling on timeout therefore means a
+	// scan that can't finish inside maxWaitMs restarts from scratch every
+	// tick and never seeds the cache — with cancelOnTimeout:false we walk
+	// away and let the server finish the job so the next tick is
+	// incremental. A completed job is always safe to cancel (no-op).
+	if (completed || cancelOnTimeout) {
+		try {
+			if (chain === 'monero') await cancelMoneroJob(client, started);
+			else await cancelOrchardJob(client, started);
+		}
+		catch { /* job already complete — ignore */ }
 	}
-	catch { /* job already complete — ignore */ }
-	return { chain, chainHeight, scannedHeight: lastJob.scannedHeight ?? 0, incoming };
+	return { chain, chainHeight, scannedHeight: lastJob.scannedHeight ?? 0, incoming, completed };
 }
 
 /**

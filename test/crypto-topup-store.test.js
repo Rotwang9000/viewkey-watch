@@ -85,6 +85,19 @@ describe('listMatchable', () => {
 		createQuote(db, baseQuote({ id: 'z', chain: 'zcash', memo: 'SNS-1', expectedAtomic: 2n }));
 		expect(listMatchable(db, 'zcash', 600).map(r => r.id)).toEqual(['z']);
 	});
+
+	test('graceMs re-admits recently-expired quotes, but not older ones', () => {
+		createQuote(db, baseQuote({ id: 'just-expired', expectedAtomic: 1n, expiresAtMs: 500 }));
+		createQuote(db, baseQuote({ id: 'long-expired', expectedAtomic: 2n, expiresAtMs: 100 }));
+		expireStalePending(db, 600);
+		expect(getQuote(db, 'just-expired').status).toBe('expired');
+
+		// No grace (default): neither shows up.
+		expect(listMatchable(db, 'monero', 600).map(r => r.id)).toEqual([]);
+		// Grace window covers 500 but not 100 at now=600.
+		const ids = listMatchable(db, 'monero', 600, { graceMs: 200 }).map(r => r.id);
+		expect(ids).toEqual(['just-expired']);
+	});
 });
 
 describe('hasOpenQuoteWithAmount', () => {
@@ -107,6 +120,22 @@ describe('markSeen / markSettled', () => {
 		createQuote(db, baseQuote({ id: 'q1' }));
 		const row = markSeen(db, 'q1', { txHash: 'deadbeef', seenAtomic: 10_400_000_005n, blockHeight: 3_300_000, confirmations: 4 });
 		expect(row).toMatchObject({ status: 'confirming', seen_tx_hash: 'deadbeef', seen_atomic: '10400000005', confirmations: 4 });
+	});
+
+	test('an expired quote can still be seen and settled (grace path)', () => {
+		createQuote(db, baseQuote({ id: 'q1', expiresAtMs: 500 }));
+		expireStalePending(db, 600);
+		expect(getQuote(db, 'q1').status).toBe('expired');
+		const seen = markSeen(db, 'q1', { txHash: 'late-tx', seenAtomic: 10_400_000_000n, blockHeight: 42, confirmations: 3 });
+		expect(seen.status).toBe('confirming');
+		const settled = markSettled(db, 'q1', { creditedUsdCents: 500, txHash: 'late-tx', seenAtomic: 10_400_000_000n, confirmations: 10, settledAtMs: 9_000 });
+		expect(settled).toMatchObject({ status: 'settled', credited_usd_cents: 500 });
+	});
+
+	test('settled and cancelled quotes stay frozen — seen/settle no-ops', () => {
+		createQuote(db, baseQuote({ id: 'c1' }));
+		cancelQuote(db, 'c1', 'token-abc-12345678');
+		expect(markSeen(db, 'c1', { txHash: 't', seenAtomic: 1n, blockHeight: 1, confirmations: 1 }).status).toBe('cancelled');
 	});
 
 	test('settled records credited cents and freezes status', () => {

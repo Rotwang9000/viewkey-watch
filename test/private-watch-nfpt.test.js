@@ -17,7 +17,8 @@ import {
 	healthCheck,
 	normaliseMonero,
 	normaliseOrchard,
-	scanHistorical
+	scanHistorical,
+	scanReceiving
 } from '../src/private-watch-nfpt.js';
 
 function fetchOk(body, status = 200) {
@@ -312,5 +313,81 @@ describe('normaliseMonero / normaliseOrchard', () => {
 		expect(out.scannedHeight).toBe(3_414_000);
 		expect(out.chainHeight).toBe(3_414_400);
 		expect(out.scanProgress).toBe(1);
+	});
+});
+
+describe('scanReceiving — timeout cancel semantics', () => {
+	// A zcash fixture NFPT that answers start (202), poll (running forever),
+	// and records any DELETE (cancel). The job never completes, so a short
+	// maxWaitMs forces the timeout path.
+	function neverCompletingNfpt() {
+		const cancels = [];
+		const fetch = async (url, init) => {
+			const method = init?.method ?? 'GET';
+			if (method === 'POST') {
+				return { status: 202, text: async () => JSON.stringify({ data: { jobId: 'J1', jobToken: 'T1' } }) };
+			}
+			if (method === 'DELETE') {
+				cancels.push(url);
+				return { status: 200, text: async () => '{}' };
+			}
+			return { status: 200, text: async () => JSON.stringify({
+				data: { job: {
+					status: 'running',
+					progress: { currentStart: 3_100_000, latestHeight: 3_099_000, scanProgress: 0.1 },
+					results: { notes: [] }
+				} }
+			}) };
+		};
+		return { cancels, fetch };
+	}
+
+	const args = {
+		chain: 'zcash',
+		address: 'u1recv',
+		viewKey: 'uview1abc',
+		birthdayHeight: 3_100_000,
+		pollIntervalMs: 1,
+		maxWaitMs: 30
+	};
+
+	test('default (cancelOnTimeout true) cancels the abandoned job', async () => {
+		const fx = neverCompletingNfpt();
+		const c = createNfptClient({ baseUrl: 'http://nfpt', apiKey: 'k', fetchImpl: fx.fetch });
+		const out = await scanReceiving(c, { ...args });
+		expect(out.completed).toBe(false);
+		expect(out.incoming).toEqual([]);
+		expect(fx.cancels).toHaveLength(1);
+	});
+
+	test('cancelOnTimeout:false leaves the job running so NFPT can finish and cache', async () => {
+		const fx = neverCompletingNfpt();
+		const c = createNfptClient({ baseUrl: 'http://nfpt', apiKey: 'k', fetchImpl: fx.fetch });
+		const out = await scanReceiving(c, { ...args, cancelOnTimeout: false });
+		expect(out.completed).toBe(false);
+		expect(fx.cancels).toHaveLength(0);
+	});
+
+	test('a completed job is cancelled (cleanup no-op) even with cancelOnTimeout:false', async () => {
+		const cancels = [];
+		const fetch = async (url, init) => {
+			const method = init?.method ?? 'GET';
+			if (method === 'POST') return { status: 202, text: async () => JSON.stringify({ data: { jobId: 'J1', jobToken: 'T1' } }) };
+			if (method === 'DELETE') { cancels.push(url); return { status: 200, text: async () => '{}' }; }
+			return { status: 200, text: async () => JSON.stringify({
+				data: { job: {
+					status: 'succeeded',
+					progress: { latestHeight: 3_200_000, chainTip: 3_200_000, percentComplete: 100 },
+					results: { notes: [ { value: '2000000', txid: 'zt1', height: 3_199_990, memo: 'PG-x' } ] }
+				} }
+			}) };
+		};
+		const c = createNfptClient({ baseUrl: 'http://nfpt', apiKey: 'k', fetchImpl: fetch });
+		const out = await scanReceiving(c, { ...args, cancelOnTimeout: false });
+		expect(out.completed).toBe(true);
+		expect(out.incoming).toEqual([
+			{ amountAtomic: '2000000', txHash: 'zt1', blockHeight: 3_199_990, memo: 'PG-x' }
+		]);
+		expect(cancels).toHaveLength(1);
 	});
 });

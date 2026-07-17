@@ -123,18 +123,24 @@ export function getQuoteAuthorised(db, id, watchToken) {
 
 /**
  * Quotes the poller should still try to match for a chain:
- *   - 'pending' that haven't expired (still awaiting a first sighting), and
+ *   - 'pending' that haven't expired (still awaiting a first sighting),
  *   - 'confirming' (payment already seen — keep counting confs regardless
- *     of the original pay-by deadline).
+ *     of the original pay-by deadline), and
+ *   - with `graceMs` > 0, 'expired' quotes whose deadline passed within
+ *     the grace window. A payer who sent the exact memo/amount but whose
+ *     payment was only *noticed* after expiry (slow confs, scanner
+ *     outage) still deserves the credit — the memo/amount match makes a
+ *     false attribution impossible, so late settling is always honest.
  */
-export function listMatchable(db, chain, nowMs) {
+export function listMatchable(db, chain, nowMs, { graceMs = 0 } = {}) {
 	return db.prepare(`
 		SELECT * FROM crypto_topup_quotes
 		WHERE chain = ?
 		  AND ( (status = 'pending' AND expires_at_ms > ?)
-		     OR  status = 'confirming' )
+		     OR  status = 'confirming'
+		     OR (status = 'expired' AND expires_at_ms > ?) )
 		ORDER BY created_at_ms ASC
-	`).all(chain, nowMs);
+	`).all(chain, nowMs, nowMs - Math.max(0, graceMs));
 }
 
 /** True if an open quote on this chain already claims `expectedAtomic` (collision guard for XMR amount matching). */
@@ -147,7 +153,11 @@ export function hasOpenQuoteWithAmount(db, chain, expectedAtomic) {
 	return Boolean(row);
 }
 
-/** Record that a matching payment was seen but isn't yet fully confirmed. */
+/**
+ * Record that a matching payment was seen but isn't yet fully confirmed.
+ * Accepts 'expired' too: a quote the sweep expired before its payment was
+ * noticed flips straight to 'confirming' (see listMatchable grace window).
+ */
 export function markSeen(db, id, { txHash, seenAtomic, blockHeight, confirmations }) {
 	db.prepare(`
 		UPDATE crypto_topup_quotes
@@ -156,7 +166,7 @@ export function markSeen(db, id, { txHash, seenAtomic, blockHeight, confirmation
 		    seen_atomic = ?,
 		    seen_block_height = ?,
 		    confirmations = ?
-		WHERE id = ? AND status IN ('pending','confirming')
+		WHERE id = ? AND status IN ('pending','confirming','expired')
 	`).run(txHash, String(seenAtomic), blockHeight ?? null, confirmations ?? 0, id);
 	return getQuote(db, id);
 }
@@ -171,7 +181,7 @@ export function markSettled(db, id, { creditedUsdCents, txHash, seenAtomic, conf
 		    seen_atomic = COALESCE(?, seen_atomic),
 		    confirmations = ?,
 		    settled_at_ms = ?
-		WHERE id = ? AND status IN ('pending','confirming')
+		WHERE id = ? AND status IN ('pending','confirming','expired')
 	`).run(creditedUsdCents, txHash ?? null, seenAtomic == null ? null : String(seenAtomic), confirmations ?? 0, settledAtMs, id);
 	return getQuote(db, id);
 }

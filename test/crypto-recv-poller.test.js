@@ -159,6 +159,28 @@ describe('runCryptoRecvTick — state machine', () => {
 		expect(summary.expired).toBe(1);
 		expect(getQuote(db, 'q1').status).toBe('expired');
 	});
+
+	test('matchGraceMs settles an expired-but-paid quote on a later tick', async () => {
+		// Quote expired at 500; payment only becomes visible at now=10_000.
+		createQuote(db, quoteParams({ id: 'late', chain: 'zcash', memo: 'PG-late', expectedAtomic: 2_000_000n, expiresAtMs: 500 }));
+		const apply = spyApplyCredit();
+		const scan = async () => ({ chainHeight: 100, incoming: [{ amountAtomic: '2000000', txHash: 'ztx', blockHeight: 91, memo: 'PG-late' }] });
+
+		// First tick sweeps it to expired (no matching payment yet visible... use empty scan).
+		await runCryptoRecvTick({ db, chains: ['zcash'], scan: async () => ({ chainHeight: 1, incoming: [] }), applyCredit: apply, confirmations: { zcash: 8 }, now: () => 1_000 });
+		expect(getQuote(db, 'late').status).toBe('expired');
+
+		// Without grace, the payment is invisible to matching.
+		await runCryptoRecvTick({ db, chains: ['zcash'], scan, applyCredit: apply, confirmations: { zcash: 8 }, now: () => 10_000 });
+		expect(getQuote(db, 'late').status).toBe('expired');
+		expect(apply.calls).toHaveLength(0);
+
+		// With grace covering the deadline, it settles honestly.
+		const summary = await runCryptoRecvTick({ db, chains: ['zcash'], scan, applyCredit: apply, confirmations: { zcash: 8 }, matchGraceMs: 100_000, now: () => 10_000 });
+		expect(summary.settled).toBe(1);
+		expect(apply.calls).toEqual([{ watchId: 'w-1', usdCents: 500 }]);
+		expect(getQuote(db, 'late')).toMatchObject({ status: 'settled', credited_usd_cents: 500 });
+	});
 });
 
 describe('makeWatchCreditApplier', () => {

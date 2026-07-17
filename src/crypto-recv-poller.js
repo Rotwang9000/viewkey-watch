@@ -84,6 +84,10 @@ export function creditCentsFor(quote, payment) {
  *   - scan(chain)   async -> { chainHeight, incoming: [...] }
  *   - applyCredit({watchId, usdCents}) -> { ok, ... } | { ok:false, reason }
  *   - confirmations { monero: 10, zcash: 8 }
+ *   - matchGraceMs  how long after a quote's pay-by deadline a matching
+ *                   payment can still settle it (default 0 = never).
+ *                   Memo/amount matching makes late settling safe; the
+ *                   deadline only bounds the *rate lock*, not honesty.
  *   - now()         clock (testable)
  *   - logger        pino-like (info/warn/error)
  */
@@ -93,6 +97,7 @@ export async function runCryptoRecvTick({
 	scan,
 	applyCredit,
 	confirmations = {},
+	matchGraceMs = 0,
 	now = () => Date.now(),
 	logger = { info() {}, warn() {}, error() {} }
 }) {
@@ -120,7 +125,7 @@ export async function runCryptoRecvTick({
 		const required = Number(confirmations?.[chain] ?? 0);
 		cs.scanned = incoming.length;
 
-		for (const quote of listMatchable(db, chain, now())) {
+		for (const quote of listMatchable(db, chain, now(), { graceMs: matchGraceMs })) {
 			const payment = matchIncoming(chain, quote, incoming);
 			if (!payment) continue;
 			cs.matched += 1; summary.matched += 1;
