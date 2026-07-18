@@ -71,6 +71,19 @@ const toHex = (bytes) =>
 	Array.from(bytes ?? [], (b) => b.toString(16).padStart(2, '0')).join('');
 
 /**
+ * Platform shielded notes are denominated in CREDITS, not duffs:
+ * 1 duff = 1000 credits (dpp `CREDITS_PER_DUFF`). Quote amounts are in
+ * duffs (COIN_DECIMALS.dash = 8), so scan output converts credits →
+ * duffs, rounding DOWN so an underpayment can never round up to full.
+ */
+export const CREDITS_PER_DUFF = 1000n;
+
+export const creditsToDuffs = (credits) => {
+	const c = typeof credits === 'bigint' ? credits : BigInt(credits);
+	return c / CREDITS_PER_DUFF;
+};
+
+/**
  * Derive watch-only keys for the receiving wallet from BIP-39 seed
  * bytes (hex string or Uint8Array). Ops helper for initial setup —
  * returns `{ fvk, defaultAddress }` (both hex); only viewing material.
@@ -144,7 +157,10 @@ export async function scanDashReceiving({
 		const hits = wasmMod.trial_decrypt(fvk.trim().toLowerCase(), wireNotes);
 		for (const hit of hits) {
 			incoming.push({
-				amountAtomic: String(hit.duffs),
+				// hit.duffs is the RAW NOTE VALUE — Platform denominates
+				// notes in credits; convert to duffs for quote matching.
+				amountAtomic: String(creditsToDuffs(hit.duffs)),
+				amountCredits: String(hit.duffs),
 				memo: hit.memo_text ?? '',
 				txHash: hit.nullifier,
 				blockHeight: 1,

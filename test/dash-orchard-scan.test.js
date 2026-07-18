@@ -4,7 +4,12 @@
 // report instant finality (blockHeight = chainHeight = 1).
 
 import { jest } from '@jest/globals';
-import { scanDashReceiving, DASH_NOTES_PAGE_SIZE } from '../src/dash-orchard-scan.js';
+import {
+	scanDashReceiving,
+	creditsToDuffs,
+	CREDITS_PER_DUFF,
+	DASH_NOTES_PAGE_SIZE
+} from '../src/dash-orchard-scan.js';
 
 const FVK = 'ab'.repeat(96);
 
@@ -63,7 +68,10 @@ describe('scanDashReceiving', () => {
 		});
 
 		expect(result.incoming).toEqual([{
-			amountAtomic: '123456789',
+			// The wasm reported 123456789 CREDITS; matching wants duffs
+			// (1 duff = 1000 credits, floor division).
+			amountAtomic: '123456',
+			amountCredits: '123456789',
 			memo: 'PG-3f4807e5',
 			txHash: 'c1'.repeat(32),
 			blockHeight: 1,
@@ -106,5 +114,14 @@ describe('scanDashReceiving', () => {
 		const result = await scanDashReceiving({ fvk: FVK, sdk, wasm, pageSize: 100, maxNotes: 150 });
 		expect(result.scanned).toBe(200); // stops after the page that crosses the cap
 		expect(sdk.shielded.encryptedNotes).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe('creditsToDuffs', () => {
+	test('1 duff = 1000 credits, floor division (never rounds an underpayment up)', () => {
+		expect(CREDITS_PER_DUFF).toBe(1000n);
+		expect(creditsToDuffs('1000')).toBe(1n);
+		expect(creditsToDuffs('999')).toBe(0n);
+		expect(creditsToDuffs(250695832400n)).toBe(250695832n);
 	});
 });
