@@ -42,7 +42,7 @@ describe('scanDashReceiving', () => {
 		const wasm = {
 			trial_decrypt: jest.fn()
 				.mockReturnValueOnce([{
-					index: 7, duffs: '123456789', scope: 'external',
+					index: 7, credits: '123456789', scope: 'external',
 					nullifier: 'c1'.repeat(32), memo_text: 'PG-3f4807e5', memo_hex: '00'.repeat(36),
 					address: 'aa'.repeat(43)
 				}])
@@ -96,7 +96,7 @@ describe('scanDashReceiving', () => {
 		]]);
 		const wasm = {
 			trial_decrypt: jest.fn().mockReturnValue([{
-				index: 0, duffs: '1', scope: 'internal',
+				index: 0, credits: '1', scope: 'internal',
 				nullifier: 'c2'.repeat(32), memo_text: null, memo_hex: '00'.repeat(36),
 				address: 'aa'.repeat(43)
 			}])

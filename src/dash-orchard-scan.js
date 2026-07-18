@@ -157,10 +157,10 @@ export async function scanDashReceiving({
 		const hits = wasmMod.trial_decrypt(fvk.trim().toLowerCase(), wireNotes);
 		for (const hit of hits) {
 			incoming.push({
-				// hit.duffs is the RAW NOTE VALUE — Platform denominates
-				// notes in credits; convert to duffs for quote matching.
-				amountAtomic: String(creditsToDuffs(hit.duffs)),
-				amountCredits: String(hit.duffs),
+				// Platform denominates notes in credits; quote matching
+				// wants duffs.
+				amountAtomic: String(creditsToDuffs(hit.credits)),
+				amountCredits: String(hit.credits),
 				memo: hit.memo_text ?? '',
 				txHash: hit.nullifier,
 				blockHeight: 1,
