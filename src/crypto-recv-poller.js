@@ -35,7 +35,7 @@ export function computeConfirmations(chainHeight, blockHeight) {
 	return ch - bh + 1;
 }
 
-/** A Zcash note memo attributes to a quote when it equals (or contains) the token. */
+/** A Zcash/Dash note memo attributes to a quote when it equals (or contains) the token. */
 export function memoMatches(noteMemo, quoteMemo) {
 	if (!noteMemo || !quoteMemo) return false;
 	const a = String(noteMemo).trim();
@@ -47,7 +47,8 @@ export function memoMatches(noteMemo, quoteMemo) {
  * Find the incoming payment that satisfies a quote:
  *   - Monero: exact atomic-amount match (the quote amount carries
  *     random low digits so it's unique among open quotes).
- *   - Zcash: memo-token match (amount is validated at credit time).
+ *   - Zcash/Dash: memo-token match (amount is validated at credit
+ *     time; Dash's 36-byte Platform memo fits the token fine).
  * Returns the payment record or null.
  */
 export function matchIncoming(chain, quote, incoming) {

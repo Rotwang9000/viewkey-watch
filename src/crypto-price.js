@@ -11,18 +11,22 @@
 // unit tests never touch the network and the maths is verified in
 // isolation.
 
-/** Atomic units per whole coin. Monero = piconero (1e12), Zcash = zatoshi (1e8). */
-export const COIN_DECIMALS = Object.freeze({ monero: 12, zcash: 8 });
+/**
+ * Atomic units per whole coin. Monero = piconero (1e12), Zcash =
+ * zatoshi (1e8), Dash = duffs (1e8 — shielded top-ups arrive on the
+ * Platform Orchard pool but the unit is the same).
+ */
+export const COIN_DECIMALS = Object.freeze({ monero: 12, zcash: 8, dash: 8 });
 
 /** CoinGecko `ids` for each chain we support. */
-export const COIN_IDS = Object.freeze({ monero: 'monero', zcash: 'zcash' });
+export const COIN_IDS = Object.freeze({ monero: 'monero', zcash: 'zcash', dash: 'dash' });
 
 /** Basis-points denominator — 10_000 bps = 100%. */
 const BPS = 10_000n;
 
 function assertCoin(coin) {
-	if (coin !== 'monero' && coin !== 'zcash') {
-		throw new TypeError(`crypto-price: coin must be 'monero' or 'zcash', got ${coin}`);
+	if (!Object.hasOwn(COIN_DECIMALS, coin)) {
+		throw new TypeError(`crypto-price: coin must be one of ${Object.keys(COIN_DECIMALS).join('/')}, got ${coin}`);
 	}
 }
 
@@ -105,13 +109,13 @@ export function createPriceOracle({
 	timeoutMs = 5_000,
 	cacheTtlMs = 60_000,
 	fetchImpl = globalThis.fetch,
-	fallback = { monero: 0, zcash: 0 },
+	fallback = { monero: 0, zcash: 0, dash: 0 },
 	now = () => Date.now()
 } = {}) {
 	if (typeof fetchImpl !== 'function') {
 		throw new TypeError('createPriceOracle: fetchImpl must be a function');
 	}
-	let cache = null; // { monero, zcash, asOfMs }
+	let cache = null; // { [coin]: usd, asOfMs }
 
 	async function refresh() {
 		const ids = Object.values(COIN_IDS).join(',');
@@ -122,12 +126,22 @@ export function createPriceOracle({
 			const res = await fetchImpl(full, { signal: ac.signal, headers: { accept: 'application/json' } });
 			if (!res.ok) throw new Error(`crypto-price: oracle HTTP ${res.status}`);
 			const body = await res.json();
-			const monero = Number(body?.[COIN_IDS.monero]?.usd);
-			const zcash = Number(body?.[COIN_IDS.zcash]?.usd);
-			if (!Number.isFinite(monero) || monero <= 0 || !Number.isFinite(zcash) || zcash <= 0) {
+			// Per-coin tolerance: cache every usable price and let
+			// getUsdPrice decide per coin — one missing id must not take
+			// pricing down for the chains that DID come back.
+			const fresh = { asOfMs: now() };
+			let usable = 0;
+			for (const [coin, id] of Object.entries(COIN_IDS)) {
+				const usd = Number(body?.[id]?.usd);
+				if (Number.isFinite(usd) && usd > 0) {
+					fresh[coin] = usd;
+					usable += 1;
+				}
+			}
+			if (usable === 0) {
 				throw new Error(`crypto-price: oracle returned no usable prices (${JSON.stringify(body)})`);
 			}
-			cache = { monero, zcash, asOfMs: now() };
+			cache = fresh;
 			return cache;
 		}
 		finally {
@@ -135,27 +149,34 @@ export function createPriceOracle({
 		}
 	}
 
+	const hasPrice = (obj, coin) => Number.isFinite(obj?.[coin]) && obj[coin] > 0;
+
 	async function getUsdPrice(coin) {
 		assertCoin(coin);
-		if (cache && (now() - cache.asOfMs) < cacheTtlMs) {
+		if (cache && (now() - cache.asOfMs) < cacheTtlMs && hasPrice(cache, coin)) {
 			return { usd: cache[coin], source: 'coingecko', asOfMs: cache.asOfMs };
 		}
+		let lastErr = null;
 		try {
 			const fresh = await refresh();
-			return { usd: fresh[coin], source: 'coingecko', asOfMs: fresh.asOfMs };
+			if (hasPrice(fresh, coin)) {
+				return { usd: fresh[coin], source: 'coingecko', asOfMs: fresh.asOfMs };
+			}
+			lastErr = new Error(`crypto-price: oracle returned no usable ${coin} price`);
 		}
 		catch (err) {
-			// Serve a still-warm cache even if slightly stale before
-			// resorting to the hard fallback.
-			if (cache) {
-				return { usd: cache[coin], source: 'coingecko-stale', asOfMs: cache.asOfMs };
-			}
-			const fb = Number(fallback?.[coin] ?? 0);
-			if (Number.isFinite(fb) && fb > 0) {
-				return { usd: fb, source: 'fallback', asOfMs: now() };
-			}
-			throw new Error(`crypto-price: no price for ${coin} and no fallback configured (${err?.message ?? err})`);
+			lastErr = err;
 		}
+		// Serve a still-warm cache even if slightly stale before
+		// resorting to the hard fallback.
+		if (cache && hasPrice(cache, coin)) {
+			return { usd: cache[coin], source: 'coingecko-stale', asOfMs: cache.asOfMs };
+		}
+		const fb = Number(fallback?.[coin] ?? 0);
+		if (Number.isFinite(fb) && fb > 0) {
+			return { usd: fb, source: 'fallback', asOfMs: now() };
+		}
+		throw new Error(`crypto-price: no price for ${coin} and no fallback configured (${lastErr?.message ?? lastErr})`);
 	}
 
 	return Object.freeze({ getUsdPrice });
