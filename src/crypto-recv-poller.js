@@ -62,17 +62,19 @@ export function matchIncoming(chain, quote, incoming) {
 }
 
 /**
- * Cents to credit for a matched payment. A full / over-payment credits
- * the quoted amount; a Zcash under-payment (memo matched, sent less)
- * credits pro-rata at the locked rate the quote already embeds
- * (quoted_usd_cents per expected_atomic). Pure integer maths.
+ * Cents to credit for a matched payment: whatever was actually sent,
+ * valued at the rate the quote locked in (quoted_usd_cents per
+ * expected_atomic). Under-payments credit pro-rata and over-payments
+ * credit the excess too — the quote picks the price, the payer picks
+ * the size. Keeping the change for an over-payment would be theft, and
+ * a quote is a price, not an invoice. Pure integer maths (truncating,
+ * so rounding is always in the house's favour by at most one cent).
  */
 export function creditCentsFor(quote, payment) {
 	const expected = safeBig(quote.expected_atomic);
 	const received = safeBig(payment.amountAtomic);
 	const quoted = BigInt(quote.quoted_usd_cents);
 	if (expected === null || received === null || expected <= 0n) return Number(quoted);
-	if (received >= expected) return Number(quoted);
 	return Number((quoted * received) / expected);
 }
 

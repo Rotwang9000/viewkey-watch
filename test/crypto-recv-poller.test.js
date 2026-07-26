@@ -77,12 +77,26 @@ describe('pure helpers', () => {
 		expect(matchIncoming('zcash', q, inc)).toMatchObject({ txHash: 'tx' });
 	});
 
-	test('creditCentsFor full / over / under payment', () => {
+	test('creditCentsFor values what was actually sent, both directions', () => {
 		const q = { expected_atomic: XMR_AMOUNT.toString(), quoted_usd_cents: 500 };
 		expect(creditCentsFor(q, { amountAtomic: XMR_AMOUNT.toString() })).toBe(500);
-		expect(creditCentsFor(q, { amountAtomic: (XMR_AMOUNT * 2n).toString() })).toBe(500);
 		// Half the expected amount -> half the credit.
 		expect(creditCentsFor(q, { amountAtomic: (XMR_AMOUNT / 2n).toString() })).toBe(250);
+		// ...and paying five times the quote earns five times the credit: the
+		// quote fixes the price, not the size of the payment.
+		expect(creditCentsFor(q, { amountAtomic: (XMR_AMOUNT * 5n).toString() })).toBe(2500);
+	});
+
+	test('creditCentsFor truncates part-cents rather than rounding up', () => {
+		const q = { expected_atomic: '1000', quoted_usd_cents: 500 };
+		expect(creditCentsFor(q, { amountAtomic: '1999' })).toBe(999);
+	});
+
+	test('creditCentsFor falls back to the quoted amount when the quote is unusable', () => {
+		const q = { expected_atomic: '0', quoted_usd_cents: 500 };
+		expect(creditCentsFor(q, { amountAtomic: '12345' })).toBe(500);
+		expect(creditCentsFor({ expected_atomic: 'not-a-number', quoted_usd_cents: 500 }, { amountAtomic: '1' })).toBe(500);
+		expect(creditCentsFor({ expected_atomic: '1000', quoted_usd_cents: 500 }, { amountAtomic: null })).toBe(500);
 	});
 });
 
@@ -130,6 +144,27 @@ describe('runCryptoRecvTick — state machine', () => {
 		const summary = await runCryptoRecvTick({ db, chains: ['zcash'], scan, applyCredit: apply, confirmations: { zcash: 8 } });
 		expect(summary.settled).toBe(1);
 		expect(getQuote(db, 'z1').status).toBe('settled');
+	});
+
+	test('a zcash over-payment credits the whole amount sent', async () => {
+		// $5 quote, $25 sent: the memo still attributes it, and the payer gets
+		// the credit they paid for rather than a $20 donation to us.
+		createQuote(db, quoteParams({ id: 'z2', chain: 'zcash', memo: 'PG-over', expectedAtomic: 2_000_000n, quotedUsdCents: 500 }));
+		const apply = spyApplyCredit();
+		const scan = async () => ({ chainHeight: 50, incoming: [{ amountAtomic: '10000000', txHash: 'ztx', blockHeight: 43, memo: 'PG-over' }] });
+		const summary = await runCryptoRecvTick({ db, chains: ['zcash'], scan, applyCredit: apply, confirmations: { zcash: 8 } });
+		expect(summary.settled).toBe(1);
+		expect(apply.calls[0]).toEqual({ watchId: 'w-1', usdCents: 2500, quoteId: 'z2' });
+		expect(getQuote(db, 'z2')).toMatchObject({ status: 'settled', credited_usd_cents: 2500 });
+	});
+
+	test('a zcash under-payment credits pro-rata and still settles', async () => {
+		createQuote(db, quoteParams({ id: 'z3', chain: 'zcash', memo: 'PG-under', expectedAtomic: 2_000_000n, quotedUsdCents: 500 }));
+		const apply = spyApplyCredit();
+		const scan = async () => ({ chainHeight: 50, incoming: [{ amountAtomic: '400000', txHash: 'ztx', blockHeight: 43, memo: 'PG-under' }] });
+		await runCryptoRecvTick({ db, chains: ['zcash'], scan, applyCredit: apply, confirmations: { zcash: 8 } });
+		expect(apply.calls[0]).toEqual({ watchId: 'w-1', usdCents: 100, quoteId: 'z3' });
+		expect(getQuote(db, 'z3')).toMatchObject({ status: 'settled', credited_usd_cents: 100 });
 	});
 
 	test('a scan failure on one chain is isolated', async () => {
