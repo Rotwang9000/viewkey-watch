@@ -39,6 +39,36 @@ CREATE TABLE IF NOT EXISTS crypto_topup_quotes (
 CREATE INDEX IF NOT EXISTS idx_quote_open ON crypto_topup_quotes(chain, status);
 CREATE INDEX IF NOT EXISTS idx_quote_expiry ON crypto_topup_quotes(status, expires_at_ms);
 CREATE INDEX IF NOT EXISTS idx_quote_watch ON crypto_topup_quotes(watch_id);
+
+-- One row per payment that credited a quote. A memo is reusable — someone
+-- can pay the same quote twice, or top up in instalments — so crediting is
+-- keyed on (quote, tx) rather than on the quote alone. The primary key is
+-- what makes a second sighting of the same transaction a no-op.
+CREATE TABLE IF NOT EXISTS crypto_topup_payments (
+	quote_id TEXT NOT NULL,
+	tx_hash TEXT NOT NULL,
+	amount_atomic TEXT NOT NULL,
+	block_height INTEGER,
+	confirmations INTEGER DEFAULT 0,
+	credited_usd_cents INTEGER,      -- NULL = claimed, credit not yet applied
+	claimed_at_ms INTEGER NOT NULL,
+	credited_at_ms INTEGER,
+	PRIMARY KEY (quote_id, tx_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_payment_quote ON crypto_topup_payments(quote_id);
+`;
+
+// Quotes settled before crypto_topup_payments existed have no payment row,
+// and a quote is now matchable after settling (so instalments land). Without
+// this backfill the poller would see those old payments as uncredited and
+// pay them out a second time.
+const PAYMENT_BACKFILL_SQL = `
+INSERT OR IGNORE INTO crypto_topup_payments
+	(quote_id, tx_hash, amount_atomic, block_height, confirmations, credited_usd_cents, claimed_at_ms, credited_at_ms)
+SELECT id, seen_tx_hash, COALESCE(seen_atomic, '0'), seen_block_height, COALESCE(confirmations, 0),
+       credited_usd_cents, COALESCE(settled_at_ms, created_at_ms), settled_at_ms
+FROM crypto_topup_quotes
+WHERE status = 'settled' AND seen_tx_hash IS NOT NULL;
 `;
 
 const OPEN_STATES = Object.freeze(['pending', 'confirming']);
@@ -46,6 +76,7 @@ const OPEN_STATES = Object.freeze(['pending', 'confirming']);
 /** Create the quotes table + indexes. Idempotent; safe to call on every open. */
 export function ensureCryptoTopupSchema(db) {
 	db.exec(QUOTE_DDL);
+	db.exec(PAYMENT_BACKFILL_SQL);
 }
 
 function hashToken(token) {
@@ -126,11 +157,14 @@ export function getQuoteAuthorised(db, id, watchToken) {
  *   - 'pending' that haven't expired (still awaiting a first sighting),
  *   - 'confirming' (payment already seen — keep counting confs regardless
  *     of the original pay-by deadline), and
- *   - with `graceMs` > 0, 'expired' quotes whose deadline passed within
- *     the grace window. A payer who sent the exact memo/amount but whose
- *     payment was only *noticed* after expiry (slow confs, scanner
- *     outage) still deserves the credit — the memo/amount match makes a
+ *   - with `graceMs` > 0, 'expired' and already-'settled' quotes whose
+ *     deadline passed within the grace window. A payer who sent the exact
+ *     memo/amount but whose payment was only *noticed* after expiry (slow
+ *     confs, scanner outage) still deserves the credit, and a memo that
+ *     gets paid twice should credit twice — the memo/amount match makes a
  *     false attribution impossible, so late settling is always honest.
+ *     Per-payment records (crypto_topup_payments) stop a settled quote's
+ *     original payment from being credited again.
  */
 export function listMatchable(db, chain, nowMs, { graceMs = 0 } = {}) {
 	return db.prepare(`
@@ -138,9 +172,76 @@ export function listMatchable(db, chain, nowMs, { graceMs = 0 } = {}) {
 		WHERE chain = ?
 		  AND ( (status = 'pending' AND expires_at_ms > ?)
 		     OR  status = 'confirming'
-		     OR (status = 'expired' AND expires_at_ms > ?) )
+		     OR (status IN ('expired','settled') AND expires_at_ms > ?) )
 		ORDER BY created_at_ms ASC
 	`).all(chain, nowMs, nowMs - Math.max(0, graceMs));
+}
+
+/**
+ * Claim a payment for a quote before crediting it. Returns
+ * `{ claimed: true }` exactly once per (quote, tx): the primary key does
+ * the arbitration, so a re-scan, a second poller, or a retry after a
+ * crash can never pay the same transaction out twice.
+ */
+export function claimPayment(db, quoteId, { txHash, amountAtomic, blockHeight = null, confirmations = 0, nowMs = Date.now(), staleMs = 0 }) {
+	if (!txHash) return { claimed: false, reason: 'no_tx_hash' };
+	const info = db.prepare(`
+		INSERT OR IGNORE INTO crypto_topup_payments
+			(quote_id, tx_hash, amount_atomic, block_height, confirmations, claimed_at_ms)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`).run(quoteId, String(txHash), String(amountAtomic ?? '0'), blockHeight, confirmations, nowMs);
+	if (info.changes === 1) return { claimed: true };
+
+	// A claim with no credit against it is a crash between claiming and
+	// crediting (the poller releases its own failures). After `staleMs` it
+	// is ours to retry — otherwise the money stays uncredited for ever.
+	if (staleMs > 0) {
+		const retry = db.prepare(`
+			UPDATE crypto_topup_payments
+			SET claimed_at_ms = ?, amount_atomic = ?, block_height = ?, confirmations = ?
+			WHERE quote_id = ? AND tx_hash = ? AND credited_usd_cents IS NULL AND claimed_at_ms <= ?
+		`).run(nowMs, String(amountAtomic ?? '0'), blockHeight, confirmations, quoteId, String(txHash), nowMs - staleMs);
+		if (retry.changes === 1) return { claimed: true, retried: true };
+	}
+	return { claimed: false, reason: 'already_claimed' };
+}
+
+/** Undo a claim whose credit could not be applied, so a later tick retries it. */
+export function releasePayment(db, quoteId, txHash) {
+	const info = db.prepare(`
+		DELETE FROM crypto_topup_payments
+		WHERE quote_id = ? AND tx_hash = ? AND credited_usd_cents IS NULL
+	`).run(quoteId, String(txHash));
+	return { released: info.changes === 1 };
+}
+
+/**
+ * Record that a claimed payment was credited, and roll the quote up:
+ * status 'settled' with credited_usd_cents holding the total across every
+ * payment, so a quote paid in instalments reports what it really earned.
+ */
+export function settlePayment(db, quoteId, { txHash, creditedUsdCents, seenAtomic, confirmations, settledAtMs }) {
+	db.prepare(`
+		UPDATE crypto_topup_payments
+		SET credited_usd_cents = ?, confirmations = ?, credited_at_ms = ?
+		WHERE quote_id = ? AND tx_hash = ?
+	`).run(creditedUsdCents, confirmations ?? 0, settledAtMs, quoteId, String(txHash));
+	db.prepare(`
+		UPDATE crypto_topup_quotes
+		SET status = 'settled',
+		    credited_usd_cents = (SELECT COALESCE(SUM(credited_usd_cents), 0) FROM crypto_topup_payments WHERE quote_id = ?),
+		    seen_tx_hash = ?,
+		    seen_atomic = COALESCE(?, seen_atomic),
+		    confirmations = ?,
+		    settled_at_ms = COALESCE(settled_at_ms, ?)
+		WHERE id = ?
+	`).run(quoteId, String(txHash), seenAtomic == null ? null : String(seenAtomic), confirmations ?? 0, settledAtMs, quoteId);
+	return getQuote(db, quoteId);
+}
+
+/** Every payment recorded against a quote, oldest claim first. */
+export function listPaymentsForQuote(db, quoteId) {
+	return db.prepare('SELECT * FROM crypto_topup_payments WHERE quote_id = ? ORDER BY claimed_at_ms ASC').all(quoteId);
 }
 
 /** True if an open quote on this chain already claims `expectedAtomic` (collision guard for XMR amount matching). */

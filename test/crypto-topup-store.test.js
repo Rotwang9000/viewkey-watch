@@ -12,6 +12,10 @@ import {
 	hasOpenQuoteWithAmount,
 	markSeen,
 	markSettled,
+	claimPayment,
+	releasePayment,
+	settlePayment,
+	listPaymentsForQuote,
 	expireStalePending,
 	cancelQuote,
 	quoteStatsSnapshot
@@ -68,16 +72,21 @@ describe('getQuoteAuthorised', () => {
 });
 
 describe('listMatchable', () => {
-	test('returns pending (not expired) + confirming, excludes expired/settled', () => {
+	test('returns pending (not expired) + confirming; a still-live settled quote stays matchable', () => {
 		createQuote(db, baseQuote({ id: 'pending-live', expectedAtomic: 1n }));
 		createQuote(db, baseQuote({ id: 'pending-dead', expectedAtomic: 2n, expiresAtMs: 500 }));
 		createQuote(db, baseQuote({ id: 'confirming', expectedAtomic: 3n }));
 		markSeen(db, 'confirming', { txHash: 'tx', seenAtomic: 3n, blockHeight: 10, confirmations: 1 });
 		createQuote(db, baseQuote({ id: 'settled', expectedAtomic: 4n }));
 		markSettled(db, 'settled', { creditedUsdCents: 500, txHash: 'tx2', seenAtomic: 4n, confirmations: 10, settledAtMs: 2_000 });
+		// Settled long ago: past its deadline, so out of scope with no grace.
+		createQuote(db, baseQuote({ id: 'settled-old', expectedAtomic: 5n, expiresAtMs: 500 }));
+		markSettled(db, 'settled-old', { creditedUsdCents: 500, txHash: 'tx3', seenAtomic: 5n, confirmations: 10, settledAtMs: 400 });
 
+		// A settled quote inside its window can still take another payment —
+		// the per-payment table stops the first one being credited twice.
 		const ids = listMatchable(db, 'monero', 600).map(r => r.id).sort();
-		expect(ids).toEqual(['confirming', 'pending-live']);
+		expect(ids).toEqual(['confirming', 'pending-live', 'settled']);
 	});
 
 	test('scopes to chain', () => {
@@ -97,6 +106,52 @@ describe('listMatchable', () => {
 		// Grace window covers 500 but not 100 at now=600.
 		const ids = listMatchable(db, 'monero', 600, { graceMs: 200 }).map(r => r.id);
 		expect(ids).toEqual(['just-expired']);
+	});
+});
+
+describe('per-payment claiming', () => {
+	beforeEach(() => { createQuote(db, baseQuote({ id: 'q1' })); });
+
+	test('a transaction can only be claimed once', () => {
+		expect(claimPayment(db, 'q1', { txHash: 'tx', amountAtomic: '10', nowMs: 1 })).toEqual({ claimed: true });
+		expect(claimPayment(db, 'q1', { txHash: 'tx', amountAtomic: '10', nowMs: 2 })).toMatchObject({ claimed: false, reason: 'already_claimed' });
+		// ...but a different transaction on the same quote is its own payment.
+		expect(claimPayment(db, 'q1', { txHash: 'tx2', amountAtomic: '10', nowMs: 3 })).toEqual({ claimed: true });
+		expect(listPaymentsForQuote(db, 'q1')).toHaveLength(2);
+	});
+
+	test('a released claim can be re-claimed; a credited one cannot', () => {
+		claimPayment(db, 'q1', { txHash: 'tx', amountAtomic: '10', nowMs: 1 });
+		expect(releasePayment(db, 'q1', 'tx')).toEqual({ released: true });
+		expect(claimPayment(db, 'q1', { txHash: 'tx', amountAtomic: '10', nowMs: 2 })).toEqual({ claimed: true });
+
+		settlePayment(db, 'q1', { txHash: 'tx', creditedUsdCents: 500, seenAtomic: 10n, confirmations: 10, settledAtMs: 3 });
+		expect(releasePayment(db, 'q1', 'tx')).toEqual({ released: false });
+		expect(claimPayment(db, 'q1', { txHash: 'tx', amountAtomic: '10', nowMs: 4, staleMs: 1 })).toMatchObject({ claimed: false });
+	});
+
+	test('a stale uncredited claim is retryable, a fresh one is not', () => {
+		claimPayment(db, 'q1', { txHash: 'tx', amountAtomic: '10', nowMs: 1_000 });
+		expect(claimPayment(db, 'q1', { txHash: 'tx', amountAtomic: '10', nowMs: 1_500, staleMs: 1_000 })).toMatchObject({ claimed: false });
+		expect(claimPayment(db, 'q1', { txHash: 'tx', amountAtomic: '10', nowMs: 5_000, staleMs: 1_000 })).toMatchObject({ claimed: true, retried: true });
+	});
+
+	test('settling rolls the quote up to the sum of its payments', () => {
+		claimPayment(db, 'q1', { txHash: 'a', amountAtomic: '10', nowMs: 1 });
+		settlePayment(db, 'q1', { txHash: 'a', creditedUsdCents: 500, seenAtomic: 10n, confirmations: 10, settledAtMs: 2 });
+		claimPayment(db, 'q1', { txHash: 'b', amountAtomic: '5', nowMs: 3 });
+		settlePayment(db, 'q1', { txHash: 'b', creditedUsdCents: 250, seenAtomic: 5n, confirmations: 10, settledAtMs: 4 });
+
+		expect(getQuote(db, 'q1')).toMatchObject({
+			status: 'settled',
+			credited_usd_cents: 750,
+			seen_tx_hash: 'b',
+			settled_at_ms: 2 // first settlement stands as the settle time
+		});
+	});
+
+	test('a payment with no tx hash is refused rather than credited blind', () => {
+		expect(claimPayment(db, 'q1', { txHash: null, amountAtomic: '10' })).toEqual({ claimed: false, reason: 'no_tx_hash' });
 	});
 });
 

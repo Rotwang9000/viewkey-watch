@@ -11,12 +11,15 @@ import {
 	creditCentsFor,
 	runCryptoRecvTick,
 	makeWatchCreditApplier,
-	CENTS_TO_ATOMIC_USDC
+	CENTS_TO_ATOMIC_USDC,
+	CLAIM_STALE_MS
 } from '../src/crypto-recv-poller.js';
 import {
 	ensureCryptoTopupSchema,
 	createQuote,
-	getQuote
+	getQuote,
+	markSettled,
+	claimPayment
 } from '../src/crypto-topup-store.js';
 import { openWatchDb, createWatch, getWatchById } from '../src/private-watch-store.js';
 import { WATCH_CONSTANTS } from '../src/private-watch.js';
@@ -85,6 +88,18 @@ describe('pure helpers', () => {
 		// ...and paying five times the quote earns five times the credit: the
 		// quote fixes the price, not the size of the payment.
 		expect(creditCentsFor(q, { amountAtomic: (XMR_AMOUNT * 5n).toString() })).toBe(2500);
+	});
+
+	test('creditCentsFor treats a near-miss under-payment as paid in full', () => {
+		const q = { expected_atomic: '1000000', quoted_usd_cents: 500 };
+		// The coin price moves between quoting and sending; 2% short is the
+		// rate drifting, not someone paying less.
+		expect(creditCentsFor(q, { amountAtomic: '980000' })).toBe(500);
+		expect(creditCentsFor(q, { amountAtomic: '999999' })).toBe(500);
+		// Beyond the tolerance it is a genuine part-payment again.
+		expect(creditCentsFor(q, { amountAtomic: '970000' })).toBe(485);
+		// Over-payment is never rounded down to the quote.
+		expect(creditCentsFor(q, { amountAtomic: '1020000' })).toBe(510);
 	});
 
 	test('creditCentsFor truncates part-cents rather than rounding up', () => {
@@ -165,6 +180,78 @@ describe('runCryptoRecvTick — state machine', () => {
 		await runCryptoRecvTick({ db, chains: ['zcash'], scan, applyCredit: apply, confirmations: { zcash: 8 } });
 		expect(apply.calls[0]).toEqual({ watchId: 'w-1', usdCents: 100, quoteId: 'z3' });
 		expect(getQuote(db, 'z3')).toMatchObject({ status: 'settled', credited_usd_cents: 100 });
+	});
+
+	test('two payments on one memo credit twice', async () => {
+		// A memo is not a single-use token: paying the same page twice, or in
+		// instalments, is normal. Each transaction is money we received.
+		createQuote(db, quoteParams({ id: 'dup', chain: 'zcash', memo: 'PG-dup', expectedAtomic: 2_000_000n, quotedUsdCents: 500 }));
+		const apply = spyApplyCredit();
+		const scan = async () => ({
+			chainHeight: 50,
+			incoming: [
+				{ amountAtomic: '2000000', txHash: 'tx-a', blockHeight: 43, memo: 'PG-dup' },
+				{ amountAtomic: '2000000', txHash: 'tx-b', blockHeight: 43, memo: 'PG-dup' }
+			]
+		});
+		const summary = await runCryptoRecvTick({ db, chains: ['zcash'], scan, applyCredit: apply, confirmations: { zcash: 8 } });
+		expect(summary.settled).toBe(2);
+		expect(apply.calls).toEqual([
+			{ watchId: 'w-1', usdCents: 500, quoteId: 'dup' },
+			{ watchId: 'w-1', usdCents: 500, quoteId: 'dup' }
+		]);
+		// The quote reports what it really earned, not what it asked for.
+		expect(getQuote(db, 'dup')).toMatchObject({ status: 'settled', credited_usd_cents: 1000 });
+	});
+
+	test('a second payment on an already-settled quote is credited on a later tick', async () => {
+		createQuote(db, quoteParams({ id: 'inst', chain: 'zcash', memo: 'PG-inst', expectedAtomic: 2_000_000n, quotedUsdCents: 500 }));
+		const apply = spyApplyCredit();
+		const first = { amountAtomic: '2000000', txHash: 'tx-1', blockHeight: 43, memo: 'PG-inst' };
+		const second = { amountAtomic: '1000000', txHash: 'tx-2', blockHeight: 43, memo: 'PG-inst' };
+
+		await runCryptoRecvTick({ db, chains: ['zcash'], scan: async () => ({ chainHeight: 50, incoming: [first] }), applyCredit: apply, confirmations: { zcash: 8 } });
+		expect(getQuote(db, 'inst')).toMatchObject({ status: 'settled', credited_usd_cents: 500 });
+
+		// Later tick sees both: the first must not pay out again.
+		const summary = await runCryptoRecvTick({ db, chains: ['zcash'], scan: async () => ({ chainHeight: 50, incoming: [first, second] }), applyCredit: apply, confirmations: { zcash: 8 } });
+		expect(summary.settled).toBe(1);
+		expect(apply.calls).toHaveLength(2);
+		expect(apply.calls[1]).toEqual({ watchId: 'w-1', usdCents: 250, quoteId: 'inst' });
+		expect(getQuote(db, 'inst')).toMatchObject({ credited_usd_cents: 750 });
+	});
+
+	test('quotes settled before the payments table existed are not paid out again', async () => {
+		// Simulate the pre-upgrade world: a settled quote with no payment row.
+		createQuote(db, quoteParams({ id: 'old', chain: 'zcash', memo: 'PG-old', expectedAtomic: 2_000_000n }));
+		markSettled(db, 'old', { creditedUsdCents: 500, txHash: 'tx-old', seenAtomic: 2_000_000n, confirmations: 10, settledAtMs: 2_000 });
+		db.prepare('DELETE FROM crypto_topup_payments').run();
+
+		ensureCryptoTopupSchema(db); // the upgrade: backfills from settled quotes
+
+		const apply = spyApplyCredit();
+		const scan = async () => ({ chainHeight: 50, incoming: [{ amountAtomic: '2000000', txHash: 'tx-old', blockHeight: 43, memo: 'PG-old' }] });
+		const summary = await runCryptoRecvTick({ db, chains: ['zcash'], scan, applyCredit: apply, confirmations: { zcash: 8 } });
+		expect(summary.settled).toBe(0);
+		expect(apply.calls).toHaveLength(0);
+		expect(getQuote(db, 'old').credited_usd_cents).toBe(500);
+	});
+
+	test('a payment claimed but never credited is retried once it goes stale', async () => {
+		createQuote(db, quoteParams({ id: 'stale', chain: 'zcash', memo: 'PG-stale', expectedAtomic: 2_000_000n }));
+		// A crash between claiming and crediting leaves an uncredited claim.
+		claimPayment(db, 'stale', { txHash: 'tx-c', amountAtomic: '2000000', blockHeight: 43, confirmations: 10, nowMs: 1_000 });
+
+		const apply = spyApplyCredit();
+		const scan = async () => ({ chainHeight: 50, incoming: [{ amountAtomic: '2000000', txHash: 'tx-c', blockHeight: 43, memo: 'PG-stale' }] });
+
+		// Still fresh: leave it alone in case another worker holds it.
+		await runCryptoRecvTick({ db, chains: ['zcash'], scan, applyCredit: apply, confirmations: { zcash: 8 }, now: () => 2_000 });
+		expect(apply.calls).toHaveLength(0);
+
+		await runCryptoRecvTick({ db, chains: ['zcash'], scan, applyCredit: apply, confirmations: { zcash: 8 }, now: () => 1_000 + CLAIM_STALE_MS + 1 });
+		expect(apply.calls).toEqual([{ watchId: 'w-1', usdCents: 500, quoteId: 'stale' }]);
+		expect(getQuote(db, 'stale')).toMatchObject({ status: 'settled', credited_usd_cents: 500 });
 	});
 
 	test('a scan failure on one chain is isolated', async () => {
