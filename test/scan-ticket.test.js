@@ -18,7 +18,7 @@ import {
 	normaliseSubject,
 	MAX_TICKET_TTL_SEC
 } from '../src/scan-ticket.js';
-import { createNfptClient, startOrchardJob } from '../src/private-watch-nfpt.js';
+import { createNfptClient, startOrchardJob, scanHistorical } from '../src/private-watch-nfpt.js';
 
 const SECRET = 'shared-secret-at-least-16-chars';
 
@@ -163,5 +163,89 @@ describe('startOrchardJob — shared-queue fields', () => {
 		const out = await startOrchardJob(client(fetchImpl), { ufvk: 'uview1x' });
 		expect(out.queued).toBe(false);
 		expect(out.queue).toBeNull();
+	});
+});
+
+describe('scanHistorical — the paid path', () => {
+	const ZCASH_JOB = {
+		success: true,
+		data: { job: { status: 'succeeded', progress: {}, results: { notes: [] } } }
+	};
+
+	function twoStepFetch() {
+		const calls = [];
+		const fetchImpl = async (url, init) => {
+			calls.push({ url, init });
+			const started = { success: true, data: { jobId: 'j1', jobToken: 't1' } };
+			const body = String(url).includes('/job/') ? ZCASH_JOB : started;
+			return {
+				ok: true, status: 200,
+				headers: { get: () => 'application/json' },
+				text: async () => JSON.stringify(body),
+				json: async () => body
+			};
+		};
+		return { calls, fetchImpl };
+	}
+
+	const client = (fetchImpl) => createNfptClient({
+		baseUrl: 'http://127.0.0.1:3555', apiKey: 'k', fetchImpl
+	});
+
+	afterEach(() => { delete process.env.SCAN_TICKET_SECRET; });
+
+	test('a paid scan carries a ticket when ticketing is configured', async () => {
+		process.env.SCAN_TICKET_SECRET = SECRET;
+		const { calls, fetchImpl } = twoStepFetch();
+		await scanHistorical(client(fetchImpl), {
+			chain: 'zcash', address: 'u1abc', viewKey: 'uview1x', priority: true
+		});
+		const ticket = calls[0].init.headers['x-scan-ticket'];
+		expect(ticket).toBeTruthy();
+		expect(verifyIndependently(ticket, SECRET).ok).toBe(true);
+	});
+
+	test('an UNPAID scan carries no ticket even with a secret present', async () => {
+		process.env.SCAN_TICKET_SECRET = SECRET;
+		const { calls, fetchImpl } = twoStepFetch();
+		await scanHistorical(client(fetchImpl), {
+			chain: 'zcash', address: 'u1abc', viewKey: 'uview1x'
+		});
+		expect(calls[0].init.headers['x-scan-ticket']).toBeUndefined();
+	});
+
+	test('a paid scan still RUNS when our secret is missing — free lane, not an error', async () => {
+		// Someone who has paid must never see a failure because of a
+		// configuration gap on our side.
+		delete process.env.SCAN_TICKET_SECRET;
+		const { calls, fetchImpl } = twoStepFetch();
+		const out = await scanHistorical(client(fetchImpl), {
+			chain: 'zcash', address: 'u1abc', viewKey: 'uview1x', priority: true
+		});
+		expect(out).toBeTruthy();
+		expect(calls[0].init.headers['x-scan-ticket']).toBeUndefined();
+		// The subject is still declared, so free-tier accounting stays per user.
+		expect(calls[0].init.headers['x-scan-subject']).toMatch(/^addr:[0-9a-f]{16}$/u);
+	});
+
+	test('the default subject is derived from the ADDRESS, never the view key', async () => {
+		const { calls, fetchImpl } = twoStepFetch();
+		await scanHistorical(client(fetchImpl), {
+			chain: 'zcash', address: 'u1abc', viewKey: 'uview1SECRETKEYMATERIAL'
+		});
+		const subject = calls[0].init.headers['x-scan-subject'];
+		expect(subject).toMatch(/^addr:[0-9a-f]{16}$/u);
+		// Neither the address nor any part of the key travels in clear.
+		expect(subject).not.toContain('u1abc');
+		expect(subject.toLowerCase()).not.toContain('secretkey');
+	});
+
+	test('two addresses get two subjects, so they do not share an allowance', async () => {
+		const a = twoStepFetch();
+		await scanHistorical(client(a.fetchImpl), { chain: 'zcash', address: 'u1aaa', viewKey: 'uview1x' });
+		const b = twoStepFetch();
+		await scanHistorical(client(b.fetchImpl), { chain: 'zcash', address: 'u1bbb', viewKey: 'uview1x' });
+		expect(a.calls[0].init.headers['x-scan-subject'])
+			.not.toBe(b.calls[0].init.headers['x-scan-subject']);
 	});
 });

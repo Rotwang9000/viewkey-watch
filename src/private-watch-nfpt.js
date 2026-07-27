@@ -27,6 +27,9 @@
 // Everything below is pure JSON-RPC-style HTTP — no streaming, no
 // websockets — so we can stub `fetchImpl` in tests with zero ceremony.
 
+import { createHash } from 'node:crypto';
+import { mintScanTicket, isTicketingEnabled } from './scan-ticket.js';
+
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_BASE_URL = 'http://127.0.0.1:3555';
 
@@ -285,6 +288,20 @@ export async function deriveUfvk(client, { mnemonic, network = 'mainnet' }) {
  *     truncated: bool          // true if notes > maxNotes
  *   }
  */
+/**
+ * Free-tier subject for an address, when the caller did not supply one.
+ *
+ * Hashed, because the scanner keys its rate-limit buckets on this and it
+ * lands in logs on the other side. The address is the right identity to
+ * use — it is what distinguishes one paying user from another — but
+ * sending it in clear would leak who is being watched to anything that can
+ * read scanner logs.
+ */
+function defaultSubjectForAddress(address) {
+	const h = createHash('sha256').update(String(address ?? '')).digest('hex').slice(0, 16);
+	return `addr:${h}`;
+}
+
 export async function scanHistorical(client, {
 	chain,
 	address,
@@ -294,7 +311,17 @@ export async function scanHistorical(client, {
 	includeNotes = false,
 	maxNotes = 5_000,
 	pollIntervalMs = 1_500,
-	maxWaitMs = 240_000
+	maxWaitMs = 240_000,
+	// The caller has taken payment for this scan. When ticketing is
+	// configured we mint a single-use ticket so it takes the priority lane
+	// on the scanner's shared queue; when it is not, the scan runs in the
+	// free lane rather than failing. Someone who has paid must never get an
+	// error because OUR secret is missing.
+	priority = false,
+	// Stable id for the end user this scan is for. Defaults to a hash of
+	// the address — never the view key, which must not leave this process
+	// in any form that could be correlated back.
+	subject = null
 }) {
 	if (chain !== 'monero' && chain !== 'zcash') {
 		throw new TypeError(`scanHistorical: chain must be 'monero' or 'zcash'`);
@@ -303,13 +330,22 @@ export async function scanHistorical(client, {
 	// lookups — the user has explicitly paid for a (possibly
 	// minutes-long) scan and we want to find their earliest note
 	// without making them guess a birthday height.
+	const scanSubject = subject ?? defaultSubjectForAddress(address);
+	let ticket = null;
+	if (priority && isTicketingEnabled()) {
+		try { ticket = mintScanTicket(scanSubject); }
+		catch { ticket = null; /* free lane beats a failed paid scan */ }
+	}
+
 	const started = chain === 'monero'
 		? await startMoneroJob(client, { address, viewKey, fromHeight: birthdayHeight })
 		: await startOrchardJob(client, {
 			ufvk: viewKey,
 			birthdayHeight: birthdayHeight ?? undefined,
 			endHeight: toHeight ?? undefined,
-			autoDetect: birthdayHeight == null
+			autoDetect: birthdayHeight == null,
+			subject: scanSubject,
+			ticket
 		});
 	const startedAt = Date.now();
 	let lastJob = null;
