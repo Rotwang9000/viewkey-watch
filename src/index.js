@@ -24,6 +24,7 @@ export * as pricing from './private-watch-pricing.js';     // surge/credit prici
 export * as price from './crypto-price.js';                // USD↔coin conversion + price oracle
 export * as receiveStore from './crypto-topup-store.js';   // inbound top-up quote persistence
 export * as receivePoller from './crypto-recv-poller.js';  // inbound XMR/ZEC detection loop
+export * as scanTicket from './scan-ticket.js';            // priority-lane tickets for the shared scanner queue
 
 // ── Flat convenience: the factories/entry points most callers wire ───
 export { createNfptClient } from './private-watch-nfpt.js';
@@ -40,3 +41,4 @@ export {
 	signWebhookBody
 } from './private-watch-crypto.js';
 export { WATCH_CONSTANTS } from './private-watch.js';
+export { mintScanTicket, isTicketingEnabled } from './scan-ticket.js';

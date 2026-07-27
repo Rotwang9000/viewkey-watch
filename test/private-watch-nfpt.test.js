@@ -160,10 +160,14 @@ describe('startOrchardJob + pollOrchardJob', () => {
 		const cap = captureFetch(fetchOk({ data: { jobId: 'J', jobToken: 'T' } }, 202));
 		const c = createNfptClient({ baseUrl: 'http://nfpt', apiKey: 'k', fetchImpl: cap.fetch });
 		const out = await startOrchardJob(c, { ufvk: 'uview1...', birthdayHeight: 3042000 });
-		expect(out).toEqual({ jobId: 'J', jobToken: 'T' });
+		// `queued`/`queue` describe the shared scanner queue: a job can be
+		// accepted but not yet started, and a caller that conflates the two
+		// reports a stall. Absent them, this is the started-immediately case.
+		expect(out).toEqual({ jobId: 'J', jobToken: 'T', queued: false, queue: null });
 		expect(cap.calls[0].url).toBe('http://nfpt/api/wallet-scanner/orchard/scan-ufvk/job');
 		expect(JSON.parse(cap.calls[0].init.body)).toEqual({
-			ufvk: 'uview1...', birthdayHeight: 3042000, endHeight: undefined, autoDetect: false
+			ufvk: 'uview1...', birthdayHeight: 3042000, endHeight: undefined, autoDetect: false,
+			deepScan: false
 		});
 	});
 

@@ -145,22 +145,54 @@ export async function cancelMoneroJob(client, { jobId, jobToken }) {
 	return { cancelled: status === 200 };
 }
 
-/** Start a fresh Orchard scan job on NFPT for (ufvk, birthdayHeight). */
-export async function startOrchardJob(client, { ufvk, birthdayHeight, autoDetect, endHeight }) {
+/**
+ * Start a fresh Orchard scan job on NFPT for (ufvk, birthdayHeight).
+ *
+ * Two optional fields matter for fair queueing across products:
+ *
+ *   `subject` — who the scan is FOR. NFPT is the one scanner behind
+ *     zecmon, Seneschal and the winbit32 MCP tools, and it keys the free
+ *     tier on this rather than on the socket. We reach it over loopback,
+ *     which used to mean "uncapped"; it now means "say who you are acting
+ *     for". Omitting it is allowed but lumps every watch we own into a
+ *     single shared allowance, so pass a stable per-user id (watch id,
+ *     hashed address — never a raw view key).
+ *
+ *   `ticket` — a single-use scan ticket proving THIS scan was paid for.
+ *     Buys a place near the front of the shared queue, not a bigger
+ *     scanner. Mint it with mintScanTicket() after settling payment.
+ *
+ *   `deepScan` — sweep below NU6 to NU5. Measured at ~38 minutes; NFPT
+ *     runs one at a time globally, so expect to queue.
+ */
+export async function startOrchardJob(client, {
+	ufvk, birthdayHeight, autoDetect, endHeight, subject, ticket, deepScan
+}) {
 	if (!ufvk) throw new TypeError('startOrchardJob: ufvk is required');
+	const extra = {};
+	if (subject) extra['x-scan-subject'] = String(subject);
+	if (ticket) extra['x-scan-ticket'] = String(ticket);
 	const { status, body } = await nfptFetch(client, '/api/wallet-scanner/orchard/scan-ufvk/job', {
 		method: 'POST',
-		headers: authHeaders(client),
-		body: JSON.stringify({ ufvk, birthdayHeight, endHeight, autoDetect: autoDetect === true })
+		headers: authHeaders(client, extra),
+		body: JSON.stringify({
+			ufvk,
+			birthdayHeight,
+			endHeight,
+			autoDetect: autoDetect === true,
+			deepScan: deepScan === true
+		})
 	});
 	if (status !== 202 && status !== 200) {
 		throw new Error(`startOrchardJob: NFPT returned HTTP ${status}: ${describe(body)}`);
 	}
-	const { jobId, jobToken } = body?.data ?? {};
+	const { jobId, jobToken, queued, queue } = body?.data ?? {};
 	if (!jobId || !jobToken) {
 		throw new Error(`startOrchardJob: NFPT returned no jobId/jobToken (body=${describe(body)})`);
 	}
-	return { jobId, jobToken };
+	// `queued` means the scanner accepted the job but has not started it.
+	// Callers that treat "accepted" as "running" will report a stall.
+	return { jobId, jobToken, queued: queued === true, queue: queue ?? null };
 }
 
 /** Poll an Orchard scan job, returning the normalised snapshot. */
