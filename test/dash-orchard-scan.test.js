@@ -8,12 +8,18 @@ import {
 	scanDashReceiving,
 	creditsToDuffs,
 	CREDITS_PER_DUFF,
-	DASH_NOTES_PAGE_SIZE
+	DASH_NOTES_PAGE_SIZE,
+	DASH_NOTES_CHUNK_SIZE
 } from '../src/dash-orchard-scan.js';
 
 const FVK = 'ab'.repeat(96);
 
 const bytes = (n, fill) => new Uint8Array(n).fill(fill);
+
+/** One full MMR chunk of opaque notes. */
+const chunk = () => Array.from({ length: DASH_NOTES_CHUNK_SIZE }, () => ({
+	nullifier: bytes(32, 1), cmx: bytes(32, 2), encryptedNote: bytes(216, 3)
+}));
 
 function makeSdk(pages) {
 	const encryptedNotes = jest.fn();
@@ -38,6 +44,7 @@ describe('scanDashReceiving', () => {
 			{ nullifier: bytes(32, 4), cmx: bytes(32, 5), encryptedNote: bytes(216, 6) }
 		];
 		const sdk = makeSdk([fullPage, shortPage]);
+		const start = DASH_NOTES_CHUNK_SIZE * 2;
 
 		const wasm = {
 			trial_decrypt: jest.fn()
@@ -49,19 +56,20 @@ describe('scanDashReceiving', () => {
 				.mockReturnValueOnce([])
 		};
 
-		const result = await scanDashReceiving({ fvk: FVK, startIndex: 1000, sdk, wasm });
+		const result = await scanDashReceiving({ fvk: FVK, startIndex: start, sdk, wasm });
 
-		expect(sdk.shielded.encryptedNotes).toHaveBeenNthCalledWith(1, 1000n, DASH_NOTES_PAGE_SIZE);
-		expect(sdk.shielded.encryptedNotes).toHaveBeenNthCalledWith(2, 1200n, DASH_NOTES_PAGE_SIZE);
-		expect(result.nextIndex).toBe(1201);
-		expect(result.scanned).toBe(201);
+		expect(sdk.shielded.encryptedNotes).toHaveBeenNthCalledWith(1, BigInt(start), DASH_NOTES_PAGE_SIZE);
+		expect(sdk.shielded.encryptedNotes)
+			.toHaveBeenNthCalledWith(2, BigInt(start + DASH_NOTES_CHUNK_SIZE), DASH_NOTES_PAGE_SIZE);
+		expect(result.nextIndex).toBe(start + DASH_NOTES_CHUNK_SIZE + 1);
+		expect(result.scanned).toBe(DASH_NOTES_CHUNK_SIZE + 1);
 		expect(result.chainHeight).toBe(1);
 
 		// The WASM got the hex wire fields, indexed from the cursor.
 		const [fvkArg, wireNotes] = wasm.trial_decrypt.mock.calls[0];
 		expect(fvkArg).toBe(FVK);
 		expect(wireNotes[0]).toEqual({
-			index: 1000,
+			index: start,
 			rho: '01'.repeat(32),
 			cmx: '02'.repeat(32),
 			note: '03'.repeat(216)
@@ -106,14 +114,69 @@ describe('scanDashReceiving', () => {
 	});
 
 	test('maxNotes caps the walk mid-stream', async () => {
-		const page = Array.from({ length: 100 }, () => ({
-			nullifier: bytes(32, 1), cmx: bytes(32, 2), encryptedNote: bytes(216, 3)
-		}));
+		const page = chunk();
 		const sdk = makeSdk([page, page, page]);
 		const wasm = { trial_decrypt: jest.fn().mockReturnValue([]) };
-		const result = await scanDashReceiving({ fvk: FVK, sdk, wasm, pageSize: 100, maxNotes: 150 });
-		expect(result.scanned).toBe(200); // stops after the page that crosses the cap
+		const result = await scanDashReceiving({
+			fvk: FVK, sdk, wasm, maxNotes: DASH_NOTES_CHUNK_SIZE + 1
+		});
+		expect(result.scanned).toBe(DASH_NOTES_CHUNK_SIZE * 2); // stops after the page that crosses the cap
 		expect(sdk.shielded.encryptedNotes).toHaveBeenCalledTimes(2);
+	});
+
+	// drive-abci rejects any start_index that isn't a multiple of the MMR
+	// chunk size, so the pager may only ever move a whole chunk at a time.
+	// A 200-note stride made the second query — and with it every dash
+	// scan — fail with "start_index 200 is not chunk-aligned".
+	describe('chunk alignment', () => {
+		test('every query starts on a chunk boundary', async () => {
+			const sdk = makeSdk([chunk(), chunk(), chunk().slice(0, 5)]);
+			const wasm = { trial_decrypt: jest.fn().mockReturnValue([]) };
+			await scanDashReceiving({ fvk: FVK, sdk, wasm });
+
+			const starts = sdk.shielded.encryptedNotes.mock.calls.map(([at]) => at);
+			expect(starts).toEqual([0n, BigInt(DASH_NOTES_CHUNK_SIZE), BigInt(DASH_NOTES_CHUNK_SIZE * 2)]);
+			for (const at of starts) expect(at % BigInt(DASH_NOTES_CHUNK_SIZE)).toBe(0n);
+		});
+
+		test('a partial chunk ends the walk — the next index would be unaligned', async () => {
+			const sdk = makeSdk([chunk().slice(0, 200)]);
+			const wasm = { trial_decrypt: jest.fn().mockReturnValue([]) };
+			const result = await scanDashReceiving({ fvk: FVK, sdk, wasm });
+			expect(sdk.shielded.encryptedNotes).toHaveBeenCalledTimes(1);
+			expect(result.nextIndex).toBe(200);
+		});
+
+		test('an unaligned cursor is aligned DOWN and the notes below it dropped', async () => {
+			const sdk = makeSdk([chunk().slice(0, 300)]);
+			const wasm = { trial_decrypt: jest.fn().mockReturnValue([]) };
+			await scanDashReceiving({ fvk: FVK, startIndex: 200, sdk, wasm });
+
+			// Aligned down to 0 (rounding up to 2048 would skip payments).
+			expect(sdk.shielded.encryptedNotes).toHaveBeenCalledWith(0n, DASH_NOTES_PAGE_SIZE);
+			const [, wireNotes] = wasm.trial_decrypt.mock.calls[0];
+			expect(wireNotes).toHaveLength(100);
+			expect(wireNotes[0].index).toBe(200);
+		});
+
+		test('a page size below one chunk is raised to a whole chunk', async () => {
+			const sdk = makeSdk([chunk().slice(0, 1)]);
+			const wasm = { trial_decrypt: jest.fn().mockReturnValue([]) };
+			await scanDashReceiving({ fvk: FVK, sdk, wasm, pageSize: 200 });
+			expect(sdk.shielded.encryptedNotes).toHaveBeenCalledWith(0n, DASH_NOTES_CHUNK_SIZE);
+		});
+
+		test('a node that clamps the page to its own cap keeps the walk going', async () => {
+			// Ask for 4 chunks; the node only allows 1 and silently returns
+			// that. A short-page test would call this the end of the stream.
+			const sdk = makeSdk([chunk(), chunk().slice(0, 7)]);
+			const wasm = { trial_decrypt: jest.fn().mockReturnValue([]) };
+			const result = await scanDashReceiving({
+				fvk: FVK, sdk, wasm, pageSize: DASH_NOTES_CHUNK_SIZE * 4
+			});
+			expect(sdk.shielded.encryptedNotes).toHaveBeenCalledTimes(2);
+			expect(result.scanned).toBe(DASH_NOTES_CHUNK_SIZE + 7);
+		});
 	});
 });
 
