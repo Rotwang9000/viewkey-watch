@@ -499,3 +499,123 @@ describe('runPollerTick — credit billing', () => {
 		expect(row.delivery_attempts).toBe(1);
 	});
 });
+
+describe('runPollerTick — premature snapshots (phantom balance oscillation)', () => {
+	// Regression for a defect found by a live post-activation smoke:
+	// upstream expires idle scan jobs faster than the poll interval, so
+	// every few ticks the poller found its job gone, started a fresh one
+	// and immediately polled it. That first poll always answers
+	// "running / no notes / scannedHeight 0", which was diffed against
+	// real prior knowledge as a drain to zero — then a refill when the
+	// scan landed, then another drain, forever. One deposit produced an
+	// endless ±balance stream, re-crediting downstream consumers and
+	// burning the watch's own per-call credit on non-events.
+	const settled = { status: 200, body: { data: { job: {
+		jobId: 'J1', status: 'completed',
+		progress: { scannedHeight: 100, chainHeight: 100, scanProgress: 1, percentComplete: 100 },
+		balance: { totalAtomic: '50000', spendableAtomic: '50000', lockedAtomic: '0' },
+		error: null
+	} } } };
+
+	async function tick(nfpt, nowMs) {
+		return runPollerTick({
+			db, masterKey: MASTER_KEY,
+			nfptClient: nfpt.client,
+			fetchImpl: webhookCapture(),
+			now: () => nowMs,
+			logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} }
+		});
+	}
+
+	test('a restarted job does not publish a phantom drain to zero', async () => {
+		const w = makeMoneroWatch();
+
+		// Tick 1: job starts, scan completes, real balance delivered.
+		await tick(stubNfpt([
+			{ status: 202, body: { data: { jobId: 'J1', jobToken: 'T1' } } },
+			settled
+		]), NOW + 1000);
+		expect(webhookEvents.length).toBe(1);
+		const first = JSON.parse(webhookEvents[0].init.body);
+		expect(first.current.balanceAtomic).toBe('50000');
+		const afterFirst = getWatch(db, w.id, w.token);
+		const creditAfterFirst = afterFirst.credit_atomic;
+
+		// Tick 2: upstream has dropped the job (404). The poller starts a
+		// new one and polls it immediately — nothing scanned yet.
+		const summary = await tick(stubNfpt([
+			{ status: 404, body: { error: 'not found' } },
+			{ status: 202, body: { data: { jobId: 'J2', jobToken: 'T2' } } },
+			{ status: 200, body: { data: { job: {
+				jobId: 'J2', status: 'running',
+				progress: { scannedHeight: 0, chainHeight: 0, scanProgress: 0, percentComplete: 0 },
+				balance: { totalAtomic: '0', spendableAtomic: '0', lockedAtomic: '0' },
+				error: null
+			} } } }
+		]), NOW + 2000);
+
+		expect(summary.premature_snapshots).toBe(1);
+		// The whole point: no second webhook, and nothing billed for it.
+		expect(webhookEvents.length).toBe(1);
+		expect(summary.webhooks_attempted).toBe(0);
+		const afterSecond = getWatch(db, w.id, w.token);
+		expect(afterSecond.credit_atomic).toBe(creditAfterFirst);
+		// What we know must not regress to the phantom zero.
+		expect(JSON.parse(afterSecond.last_known_balance).balanceAtomic).toBe('50000');
+		expect(afterSecond.last_polled_at_ms).toBe(NOW + 2000);
+	});
+
+	test('the balance is delivered once the restarted scan actually lands', async () => {
+		makeMoneroWatch();
+		await tick(stubNfpt([
+			{ status: 202, body: { data: { jobId: 'J1', jobToken: 'T1' } } },
+			settled
+		]), NOW + 1000);
+		await tick(stubNfpt([
+			{ status: 404, body: { error: 'not found' } },
+			{ status: 202, body: { data: { jobId: 'J2', jobToken: 'T2' } } },
+			{ status: 200, body: { data: { job: {
+				jobId: 'J2', status: 'running',
+				progress: { scannedHeight: 0, chainHeight: 0, scanProgress: 0, percentComplete: 0 },
+				balance: { totalAtomic: '0' }, error: null
+			} } } }
+		]), NOW + 2000);
+		expect(webhookEvents.length).toBe(1);
+
+		// Tick 3: the new job has caught up and found a further deposit.
+		await tick(stubNfpt([{ status: 200, body: { data: { job: {
+			jobId: 'J2', status: 'completed',
+			progress: { scannedHeight: 200, chainHeight: 200, scanProgress: 1, percentComplete: 100 },
+			balance: { totalAtomic: '70000', spendableAtomic: '70000', lockedAtomic: '0' },
+			error: null
+		} } } }]), NOW + 3000);
+
+		expect(webhookEvents.length).toBe(2);
+		const second = JSON.parse(webhookEvents[1].init.body);
+		expect(second.event).toBe('balance_change');
+		// Diffed against the last real balance, not against the phantom
+		// zero — so the delta is the genuine +20000, not +70000.
+		expect(second.delta.before_atomic).toBe('50000');
+		expect(second.delta.balance_atomic).toBe('20000');
+	});
+
+	test('a genuine spend is still reported', async () => {
+		makeMoneroWatch();
+		await tick(stubNfpt([
+			{ status: 202, body: { data: { jobId: 'J1', jobToken: 'T1' } } },
+			settled
+		]), NOW + 1000);
+		// Same job, scan advanced, balance genuinely gone.
+		await tick(stubNfpt([{ status: 200, body: { data: { job: {
+			jobId: 'J1', status: 'completed',
+			progress: { scannedHeight: 300, chainHeight: 300, scanProgress: 1, percentComplete: 100 },
+			balance: { totalAtomic: '0', spendableAtomic: '0', lockedAtomic: '0' },
+			error: null
+		} } } }]), NOW + 2000);
+
+		expect(webhookEvents.length).toBe(2);
+		const spend = JSON.parse(webhookEvents[1].init.body);
+		expect(spend.event).toBe('balance_change');
+		expect(spend.delta.balance_atomic).toBe('-50000');
+	});
+});

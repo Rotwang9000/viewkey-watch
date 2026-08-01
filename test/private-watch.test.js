@@ -14,6 +14,7 @@ import {
 	assertWebhookUrlSafe,
 	assertWebhookHostResolvesPublic,
 	diffBalance,
+	isPrematureSnapshot,
 	buildWebhookBody,
 	buildLowCreditBody,
 	buildCreditBlock,
@@ -338,6 +339,51 @@ describe('diffBalance', () => {
 
 	test('returns null when after is null', () => {
 		expect(diffBalance({}, null)).toBeNull();
+	});
+});
+
+describe('isPrematureSnapshot', () => {
+	const known = { balanceAtomic: '50000', scannedHeight: 3_431_419, status: 'succeeded', error: null };
+
+	test('rejects the first poll of a freshly started job', () => {
+		// The exact shape upstream returns before the scan has run: no
+		// notes, no progress. Believing it publishes a phantom zero.
+		const fresh = { balanceAtomic: '0', scannedHeight: 0, status: 'running', error: null };
+		expect(isPrematureSnapshot(known, fresh)).toBe(true);
+	});
+
+	test('rejects a restarted job even before the first delivery', () => {
+		expect(isPrematureSnapshot(null, { balanceAtomic: '0', scannedHeight: 0, status: 'running', error: null })).toBe(true);
+	});
+
+	test('rejects a job that has gone backwards', () => {
+		const behind = { balanceAtomic: '0', scannedHeight: 3_428_143, status: 'running', error: null };
+		expect(isPrematureSnapshot(known, behind)).toBe(true);
+	});
+
+	test('accepts a completed scan, including a genuinely zero balance', () => {
+		const empty = { balanceAtomic: '0', scannedHeight: 3_431_500, status: 'succeeded', error: null };
+		expect(isPrematureSnapshot(known, empty)).toBe(false);
+	});
+
+	test('accepts a real spend — balance falls while the scan advances', () => {
+		const spent = { balanceAtomic: '0', scannedHeight: 3_431_500, status: 'succeeded', error: null };
+		expect(isPrematureSnapshot(known, spent)).toBe(false);
+		expect(diffBalance(known, spent).delta_atomic).toBe('-50000');
+	});
+
+	test('accepts an in-progress scan that is genuinely ahead', () => {
+		const ahead = { balanceAtomic: '50000', scannedHeight: 3_431_500, status: 'running', error: null };
+		expect(isPrematureSnapshot(known, ahead)).toBe(false);
+	});
+
+	test('never suppresses an error, however little the job has scanned', () => {
+		const failed = { balanceAtomic: '0', scannedHeight: 0, status: 'failed', error: 'lws: timeout' };
+		expect(isPrematureSnapshot(known, failed)).toBe(false);
+	});
+
+	test('is a no-op on a missing snapshot (diffBalance already handles it)', () => {
+		expect(isPrematureSnapshot(known, null)).toBe(false);
 	});
 });
 

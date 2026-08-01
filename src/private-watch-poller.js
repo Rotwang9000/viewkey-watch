@@ -40,6 +40,7 @@ import {
 } from './private-watch-store.js';
 import {
 	diffBalance,
+	isPrematureSnapshot,
 	buildWebhookBody,
 	buildLowCreditBody,
 	applyDayCharge,
@@ -241,8 +242,30 @@ async function pollOne({ row, db, masterKey, nfptClient, fetchImpl, webhookTimeo
 	summary.watches_polled += 1;
 	const beforeJson = row.last_delivered_balance;
 	const before = beforeJson ? safeJson(beforeJson) : null;
-	const diff = diffBalance(before, snapshot);
 	const nowMs = now();
+
+	// A job we just started has not scanned anything yet, so its first
+	// poll reports zero. Treat that as "no news" rather than as a
+	// balance: believing it would publish a phantom drain to zero, then
+	// a refill once the scan lands, forever. Compare against the freshest
+	// thing we know (last poll, else last delivery) so a restart is
+	// recognised even before the first webhook has gone out.
+	const lastKnown = row.last_known_balance ? safeJson(row.last_known_balance) : null;
+	const baseline = pickBetterKnown(lastKnown, before);
+	if (isPrematureSnapshot(baseline, snapshot)) {
+		summary.premature_snapshots = (summary.premature_snapshots ?? 0) + 1;
+		logger.debug?.({
+			watchId: row.id,
+			status: snapshot?.status ?? null,
+			scannedHeight: snapshot?.scannedHeight ?? null
+		}, 'private-watch: scan has not progressed yet; keeping previous balance');
+		// Record the attempt, but neither overwrite what we know nor
+		// bill a delivery for a non-event.
+		updateWatchState(db, row.id, { last_polled_at_ms: nowMs });
+		return;
+	}
+
+	const diff = diffBalance(before, snapshot);
 	const knownJson = snapshot ? JSON.stringify(snapshot) : null;
 	updateWatchState(db, row.id, {
 		last_polled_at_ms: nowMs,
@@ -469,6 +492,19 @@ async function drainBodyBounded(res, maxBytes, ac) {
 function safeJson(s) {
 	try { return JSON.parse(s); }
 	catch { return null; }
+}
+
+/**
+ * Of two snapshots we've stored, which represents the most scanning we
+ * have actually seen? `last_known_balance` is written every poll and
+ * `last_delivered_balance` only on delivery, so the former is usually
+ * ahead — but on a watch that has never delivered it is null, and after
+ * a restart it can be behind. Take whichever got further.
+ */
+function pickBetterKnown(a, b) {
+	if (!a) return b ?? null;
+	if (!b) return a;
+	return Number(a.scannedHeight ?? 0) >= Number(b.scannedHeight ?? 0) ? a : b;
 }
 
 function safeEventFromBody(body) {

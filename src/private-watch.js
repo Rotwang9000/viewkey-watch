@@ -518,6 +518,52 @@ export function buildSyntheticTestBody({ watchId, chain, address, row = null, no
 }
 
 /**
+ * Scan states that mean "this job is finished and its numbers are
+ * final". Mirrors TERMINAL_SUCCESS_STATES in private-watch-nfpt.js;
+ * duplicated rather than imported to keep this module dependency-free
+ * and pure.
+ */
+const SETTLED_SCAN_STATES = new Set(['succeeded', 'completed', 'success']);
+
+/**
+ * Is this snapshot too early to be believed?
+ *
+ * Upstream drops idle scan jobs, so a poller that ticks slower than that
+ * TTL regularly finds its job gone, starts a fresh one, and polls it
+ * immediately. That first poll necessarily answers `status: 'running'`
+ * with no notes and `scannedHeight: 0` — the scan has not looked at the
+ * chain yet. That is the *absence* of a balance, not a balance of zero.
+ *
+ * Diffing it against real prior knowledge invents a drain-to-zero,
+ * followed by a refill when the scan completes, then another drain on
+ * the next restart: an endless ±balance oscillation from one deposit.
+ * That is not just noise — consumers crediting on a positive delta
+ * re-credit forever, and because each delivery bills the watch per call,
+ * a watch also burns its own credit on events that never happened.
+ *
+ * Two shapes are untrustworthy, both requiring a non-final status so a
+ * genuinely completed scan is always believed:
+ *   - it reports no progress at all (`scannedHeight` 0), or
+ *   - it reports *less* progress than we already had (the job restarted).
+ *
+ * Deliberately NOT suppressed:
+ *   - anything carrying an `error` — a failing scan is always news;
+ *   - a real spend, which drops the balance while `scannedHeight` keeps
+ *     advancing, so neither shape above matches.
+ */
+export function isPrematureSnapshot(before, after) {
+	if (!after) return false;
+	if (after.error) return false;
+	if (SETTLED_SCAN_STATES.has(String(after.status ?? '').toLowerCase())) return false;
+	const afterHeight = Number(after.scannedHeight ?? 0);
+	if (!Number.isFinite(afterHeight)) return false;
+	if (afterHeight === 0) return true;
+	const beforeHeight = Number(before?.scannedHeight ?? 0);
+	if (!Number.isFinite(beforeHeight)) return false;
+	return afterHeight < beforeHeight;
+}
+
+/**
  * Compute the diff between two balance snapshots. Returns:
  *   - `null` if there's no semantic difference (used to skip webhook
  *     delivery on idle ticks)
@@ -525,6 +571,10 @@ export function buildSyntheticTestBody({ watchId, chain, address, row = null, no
  *
  * Snapshots are the objects produced by private-watch-nfpt.js's
  * `normaliseMonero` / `normaliseOrchard`.
+ *
+ * Callers must not feed this a snapshot that `isPrematureSnapshot()`
+ * rejects: this function compares the numbers it is given and cannot
+ * tell "balance is zero" from "we have not looked yet".
  */
 export function diffBalance(before, after) {
 	if (!after) return null;
